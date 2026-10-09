@@ -1,0 +1,51 @@
+# GeoSentinel-AI — local infrastructure
+#
+#   docker compose up -d --build     # build image + start Postgres
+#   docker compose logs -f postgres  # follow startup / init.sql output
+#   docker compose down -v           # stop and wipe the data volume
+#
+# NOTE: infra/init.sql only runs against an EMPTY data volume. After editing it,
+# use `docker compose down -v` (or apply it manually with psql).
+
+name: geosentinel-ai
+
+services:
+  postgres:
+    # Custom image: PostGIS 3.4 on PostgreSQL 16 with pgvector installed.
+    build:
+      context: ./infra/postgres
+      dockerfile: Dockerfile
+    image: geosentinel-ai/postgis-pgvector:16
+    container_name: geosentinel-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-geosentinel}
+      POSTGRES_USER: ${POSTGRES_USER:-geosentinel}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-geosentinel}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      # Log slow queries while developing the spatial/vector retrieval paths.
+      POSTGRES_LOG_MIN_DURATION_STATEMENT: "500ms"
+
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs on first boot of an empty volume: creates extensions + table.
+      - ./infra/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER:-geosentinel}" -d "$${POSTGRES_DB:-geosentinel}"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    # Shared memory headroom for parallel index builds (HNSW / GiST).
+    shm_size: 1gb
+
+volumes:
+  pgdata:

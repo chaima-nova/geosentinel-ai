@@ -1,0 +1,35 @@
+# GeoSentinel-AI — Python dependencies
+#
+# Install with:  pip install -r requirements.txt
+#
+# Versions are pinned to a known-good floor (latest releases as of 2026-10-09)
+# so the environment stays reproducible without blocking patch updates.
+
+# --- API / web layer ---
+fastapi>=0.143.0,<1.0
+uvicorn[standard]>=0.54.0,<1.0
+
+# --- Configuration / validation ---
+pydantic>=2.14.0,<3.0
+# Pydantic v2 moved BaseSettings out of `pydantic` into this package.
+# Required by app/core/config.py.
+pydantic-settings>=2.15.0,<3.0
+python-dotenv>=1.2.4,<2.0
+
+# --- Database (PostgreSQL 16 + PostGIS + pgvector) ---
+psycopg2-binary>=2.9.13,<3.0
+pgvector>=0.5.1,<1.0
+
+# --- Numerics (direct dependency of the NDVI computation) ---
+numpy>=2.0.0,<3.0
+
+# --- Geospatial ---
+# geopandas 1.2 sets the project floor: Python >= 3.11.
+geopandas>=1.2.0,<2.0
+# rasterio 1.5+ requires Python >= 3.12, so 3.11 stays on the 1.4 line.
+rasterio>=1.4.4,<1.5 ; python_version < "3.12"
+rasterio>=1.5.2,<2.0 ; python_version >= "3.12"
+
+# --- LLM / agents ---
+openai>=3.26.1,<4.0
+langgraph>=1.2.14,<2.0

@@ -1,0 +1,10 @@
+# GeoSentinel-AI — development / test dependencies
+#
+# Install with:  pip install -r requirements-dev.txt
+-r requirements.txt
+
+pytest>=9.1.1,<10.0
+# Async test support for the SatelliteDataService suite.
+pytest-asyncio>=1.4.0,<2.0
+# Coverage reporting (see README: pytest --cov=app).
+pytest-cov>=7.0.0,<8.0
