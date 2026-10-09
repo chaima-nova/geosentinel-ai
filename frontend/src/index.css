@@ -1,0 +1,61 @@
+@import "tailwindcss";
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: #09090b;
+  color: #f4f4f5;
+}
+
+/* Leaflet inside the dark theme */
+.leaflet-container {
+  background: #0b0f0e;
+  font: inherit;
+}
+
+/* Status light pulse (executing agent) */
+.node-pulse {
+  animation: nodepulse 1.1s ease-in-out infinite;
+}
+@keyframes nodepulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.7);
+  }
+  50% {
+    box-shadow: 0 0 0 9px rgba(251, 191, 36, 0);
+  }
+}
+
+/* DAG connector lines */
+.dag-link {
+  position: relative;
+  height: 2px;
+  flex: 1 1 auto;
+  background: #27272a;
+  border-radius: 9999px;
+}
+.dag-link-active {
+  background: linear-gradient(90deg, #10b981, #d946ef, #10b981);
+  background-size: 200% 100%;
+  animation: flow 0.9s linear infinite;
+  box-shadow: 0 0 12px rgba(217, 70, 239, 0.85);
+}
+.dag-link-done {
+  background: #10b981;
+  box-shadow: 0 0 6px rgba(16, 185, 129, 0.5);
+}
+@keyframes flow {
+  to {
+    background-position: -200% 0;
+  }
+}
+.dag-arrow {
+  font-size: 15px;
+  line-height: 1;
+  margin-left: -2px;
+}
