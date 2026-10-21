@@ -263,10 +263,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ) from exc
 
         logger.info(
-            "query complete audit=%s stress=%s heps=%.4f",
+            "query complete audit=%s stress=%s heps=%s evidence=%s",
             result.audit_status,
             result.grid_stress_level,
-            result.heps_score,
+            "withheld" if result.heps_score is None else f"{result.heps_score:.4f}",
+            result.evidence_status,
         )
         return result
 

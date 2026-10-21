@@ -36,6 +36,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 from app.core.schemas import GridStressLevel
@@ -43,6 +44,8 @@ from app.core.schemas import GridStressLevel
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "EvidenceProvenance",
+    "MissingVulnerabilityProvider",
     "RiskAssessment",
     "RiskComputationError",
     "RiskFactors",
@@ -75,10 +78,35 @@ POPULATION_DENSITY_MAX = 10_000.0
 #: single equity component.
 DENSITY_SHARE = 0.5
 
-#: Neutral values used when no demographic source is wired up. Deliberately
-#: mid-range: a placeholder should not silently make an area look safe.
+#: Neutral values that the placeholder provider used to report. They are no
+#: longer fed into the score: a placeholder is not evidence, so it cannot
+#: produce a HEPS value. Kept only so existing callers can still be inspected.
 DEFAULT_POPULATION_DENSITY = 1_000.0
 DEFAULT_SOCIAL_VULNERABILITY = 0.5
+
+
+class EvidenceProvenance(StrEnum):
+    """Where a piece of evidence came from and how far it can be trusted.
+
+    Only :attr:`VERIFIED` evidence may support a HEPS score. Every other value
+    is reported explicitly so a reviewer can see *why* a score is missing.
+
+    * ``VERIFIED`` — observed from a real, validated source for this query.
+    * ``SYNTHETIC`` — generated for demonstration or testing. Never scored.
+    * ``PLACEHOLDER`` — a stand-in value with no data behind it. Never scored.
+    * ``MISSING`` — no source was configured or no usable record was found.
+    * ``FAILED`` — a configured source raised an error during retrieval.
+    * ``STALE`` — a record exists but falls outside the requested window.
+    * ``INVALID`` — a record was retrieved but its values cannot be used.
+    """
+
+    VERIFIED = "verified"
+    SYNTHETIC = "synthetic"
+    PLACEHOLDER = "placeholder"
+    MISSING = "missing"
+    FAILED = "failed"
+    STALE = "stale"
+    INVALID = "invalid"
 
 
 class RiskComputationError(RuntimeError):
@@ -188,26 +216,43 @@ class StressThresholds:
 
 @dataclass(frozen=True)
 class VulnerabilityContext:
-    """Demographic exposure for one area.
+    """Demographic exposure for one area, with its provenance.
 
     Attributes:
-        population_density: Residents per square kilometre.
+        provenance: Where the numbers came from. Only ``VERIFIED`` contexts
+            can support a score.
+        source: Human-readable name of the source, for the audit trail.
+        population_density: Residents per square kilometre, or ``None`` when
+            no value is known.
         social_vulnerability: Composite social vulnerability index in [0, 1],
-            where 1 is most vulnerable.
+            where 1 is most vulnerable, or ``None`` when no value is known.
     """
 
-    population_density: float
-    social_vulnerability: float = DEFAULT_SOCIAL_VULNERABILITY
+    provenance: EvidenceProvenance
+    source: str
+    population_density: float | None = None
+    social_vulnerability: float | None = None
 
     def __post_init__(self) -> None:
-        if self.population_density < 0.0:
+        if self.population_density is not None and self.population_density < 0.0:
             raise RiskComputationError(
                 f"population_density must be >= 0, got {self.population_density}"
             )
-        if not 0.0 <= self.social_vulnerability <= 1.0:
+        if self.social_vulnerability is not None and not (
+            0.0 <= self.social_vulnerability <= 1.0
+        ):
             raise RiskComputationError(
                 f"social_vulnerability must be within [0, 1], got {self.social_vulnerability}"
             )
+
+    @property
+    def is_scoreable(self) -> bool:
+        """True only when the context is verified and both values are present."""
+        return (
+            self.provenance is EvidenceProvenance.VERIFIED
+            and self.population_density is not None
+            and self.social_vulnerability is not None
+        )
 
 
 @runtime_checkable
@@ -219,29 +264,47 @@ class VulnerabilityProvider(Protocol):
         ...
 
 
-class StaticVulnerabilityProvider:
-    """Placeholder provider returning a neutral baseline.
+class MissingVulnerabilityProvider:
+    """Default provider used when no demographic dataset is configured.
 
-    No demographic dataset is wired up yet, so this returns mid-range values
-    rather than zeros: a missing equity input should not make an area look
-    safe. Swap in a real source (WorldPop, GHSL, a national census) by
-    implementing :class:`VulnerabilityProvider` and passing it to
-    ``CoordinatorAgent``.
+    It reports ``MISSING`` with no values, so no HEPS score can be produced.
+    This replaces the old neutral placeholder, which silently scored every
+    area as if it had average demographics.
+    """
+
+    async def fetch(self, bbox: Sequence[float]) -> VulnerabilityContext:
+        """Return an explicitly missing context for any area."""
+        return VulnerabilityContext(
+            provenance=EvidenceProvenance.MISSING,
+            source="no demographic source configured",
+        )
+
+
+class StaticVulnerabilityProvider:
+    """Explicit placeholder provider for tests and local wiring only.
+
+    Its context is labelled ``PLACEHOLDER`` and therefore never supports a
+    HEPS score, however the values are set. It is not a demographic dataset.
 
     Args:
-        population_density: Residents per km² to report for every area.
-        social_vulnerability: Index in [0, 1] to report for every area.
+        population_density: Residents per km² to report, or ``None``.
+        social_vulnerability: Index in [0, 1] to report, or ``None``.
     """
 
     def __init__(
         self,
-        population_density: float = DEFAULT_POPULATION_DENSITY,
-        social_vulnerability: float = DEFAULT_SOCIAL_VULNERABILITY,
+        population_density: float | None = None,
+        social_vulnerability: float | None = None,
     ) -> None:
-        self._context = VulnerabilityContext(population_density, social_vulnerability)
+        self._context = VulnerabilityContext(
+            provenance=EvidenceProvenance.PLACEHOLDER,
+            source="static placeholder (not a dataset)",
+            population_density=population_density,
+            social_vulnerability=social_vulnerability,
+        )
 
     async def fetch(self, bbox: Sequence[float]) -> VulnerabilityContext:
-        """Return the same neutral context for any area."""
+        """Return the same placeholder context for any area."""
         return self._context
 
 
@@ -255,12 +318,13 @@ class RiskFactors:
     Attributes:
         heat_exposure: Normalised land-surface temperature, or ``None``.
         cooling_deficit: Inverted normalised NDVI, or ``None``.
-        vulnerability: Blended density and social vulnerability in [0, 1].
+        vulnerability: Blended density and social vulnerability in [0, 1], or
+            ``None`` when the demographic evidence is not verified.
     """
 
     heat_exposure: float | None
     cooling_deficit: float | None
-    vulnerability: float
+    vulnerability: float | None
 
 
 @dataclass(frozen=True)
@@ -276,21 +340,25 @@ class RiskAssessment:
         notes: Human-readable explanations of any adjustment.
     """
 
-    heps_score: float
-    stress_level: GridStressLevel
+    heps_score: float | None
+    stress_level: GridStressLevel | None
     factors: RiskFactors
     weights_used: dict[str, float] = field(default_factory=dict)
     data_complete: bool = True
     notes: tuple[str, ...] = ()
+    vulnerability_provenance: EvidenceProvenance = EvidenceProvenance.MISSING
 
     @property
     def recommended_audit_status(self) -> str:
         """Audit status implied by how much evidence backed the score.
 
         Returns:
+            ``"insufficient_evidence"`` when no score could be defended,
             ``"passed"`` when every component was observed, otherwise
             ``"escalated"`` so a human reviews the incomplete assessment.
         """
+        if self.heps_score is None:
+            return "insufficient_evidence"
         return "passed" if self.data_complete else "escalated"
 
 
@@ -309,6 +377,12 @@ def compute_heps(
     translated to ``None`` by the caller. Available components are blended with
     their weights renormalised to sum to 1.
 
+    The equity component is the only one that can anchor a score. If the
+    demographic context is not verified, or its values are missing, no HEPS
+    score is produced: the returned assessment has ``heps_score=None`` and
+    ``stress_level=None``, while any satellite components are still reported
+    as partial evidence.
+
     Args:
         lst_celsius: Maximum land-surface temperature in °C, or ``None``.
         ndvi: Mean NDVI in [-1, 1], or ``None``.
@@ -320,8 +394,7 @@ def compute_heps(
         A :class:`RiskAssessment` carrying the score and its provenance.
 
     Raises:
-        RiskComputationError: If no component is available, or the weights or
-            thresholds are invalid.
+        RiskComputationError: If the weights or thresholds are invalid.
     """
     weights = weights or RiskWeights()
     thresholds = thresholds or StressThresholds()
@@ -342,6 +415,26 @@ def compute_heps(
     else:
         notes.append(
             "NDVI unavailable; cooling deficit excluded and weights renormalised"
+        )
+
+    if not vulnerability.is_scoreable:
+        notes.append(
+            f"demographic evidence is {vulnerability.provenance.value} "
+            f"({vulnerability.source}); no HEPS score produced"
+        )
+        logger.warning("HEPS withheld: %s", notes[-1])
+        return RiskAssessment(
+            heps_score=None,
+            stress_level=None,
+            factors=RiskFactors(
+                heat_exposure=heat_exposure,
+                cooling_deficit=cooling_deficit,
+                vulnerability=None,
+            ),
+            weights_used={},
+            data_complete=False,
+            notes=tuple(notes),
+            vulnerability_provenance=vulnerability.provenance,
         )
 
     vulnerability_score = _blend_vulnerability(vulnerability)
@@ -386,6 +479,7 @@ def compute_heps(
         weights_used=renormalised,
         data_complete=data_complete,
         notes=tuple(notes),
+        vulnerability_provenance=vulnerability.provenance,
     )
     logger.debug(
         "HEPS %.4f (%s) from heat=%s cooling=%s vulnerability=%.4f",
@@ -402,11 +496,18 @@ def _blend_vulnerability(context: VulnerabilityContext) -> float:
     """Combine population density and social vulnerability into one 0-1 score.
 
     Args:
-        context: The demographic inputs.
+        context: The demographic inputs. Must be scoreable.
 
     Returns:
         The blended equity component in [0, 1].
+
+    Raises:
+        RiskComputationError: If the context is not scoreable.
     """
+    if not context.is_scoreable:
+        raise RiskComputationError("demographic context is not verified or incomplete")
+    assert context.population_density is not None
+    assert context.social_vulnerability is not None
     density = _clamp01(context.population_density / POPULATION_DENSITY_MAX)
     return _clamp01(
         DENSITY_SHARE * density + (1.0 - DENSITY_SHARE) * context.social_vulnerability

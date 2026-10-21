@@ -38,15 +38,18 @@ from langgraph.graph import END, START, StateGraph
 
 from app.core.schemas import (
     AuditStatus,
-    GridStressLevel,
+    EvidenceItem,
+    EvidenceStatus,
     RiskAnalysisResult,
     SatelliteLayerMetadata,
     SpatialQueryRequest,
 )
+from app.services.evidence_auditor import audit_conclusion
 from app.services.risk_service import (
+    EvidenceProvenance,
+    MissingVulnerabilityProvider,
     RiskComputationError,
     RiskWeights,
-    StaticVulnerabilityProvider,
     StressThresholds,
     VulnerabilityContext,
     VulnerabilityProvider,
@@ -70,7 +73,8 @@ class PipelineState(TypedDict, total=False):
         request: The validated query being executed.
         layer: Satellite metrics, or ``None`` if retrieval produced nothing.
         vulnerability: Demographic exposure as a plain dict, for state
-            serialisability.
+            serialisability. Includes the evidence ``provenance`` and ``source``.
+        failed_stage: Name of the phase that raised, when ``error`` is set.
         assessment: The computed HEPS payload, as a plain dict.
         error: Set when a phase failed hard; short-circuits to consolidation.
         result: The final result payload, written by the consolidation phase.
@@ -79,9 +83,10 @@ class PipelineState(TypedDict, total=False):
 
     request: SpatialQueryRequest
     layer: dict[str, Any] | None
-    vulnerability: dict[str, float]
+    vulnerability: dict[str, Any]
     assessment: dict[str, Any]
     error: str | None
+    failed_stage: str
     result: dict[str, Any]
     phases: list[str]
 
@@ -93,8 +98,9 @@ class CoordinatorAgent:
         satellite_service: Source of Sentinel-2 metrics. Defaults to a
             :class:`SatelliteDataService` pointed at the CDSE STAC API.
         vulnerability_provider: Source of demographic exposure. Defaults to
-            :class:`StaticVulnerabilityProvider`, a documented neutral
-            placeholder — wire a real dataset for meaningful equity weighting.
+            :class:`MissingVulnerabilityProvider`, which reports no evidence, so
+            the default pipeline produces no HEPS score. Wire a real, verified
+            dataset to obtain scores.
         weights: HEPS blend weights.
         thresholds: HEPS-to-stress-level cut-offs.
         provides_lst: Whether the wired satellite source supplies land-surface
@@ -115,7 +121,7 @@ class CoordinatorAgent:
                 end_date="2024-06-30",
             )
         )
-        print(result.heps_score, result.grid_stress_level, result.audit_status)
+        print(result.heps_score, result.grid_stress_level, result.audit_status)  # None = withheld
     """
 
     def __init__(
@@ -129,7 +135,7 @@ class CoordinatorAgent:
     ) -> None:
         self._satellite = satellite_service or SatelliteDataService()
         self._vulnerability: VulnerabilityProvider = (
-            vulnerability_provider or StaticVulnerabilityProvider()
+            vulnerability_provider or MissingVulnerabilityProvider()
         )
         self._weights = weights or RiskWeights()
         self._thresholds = thresholds or StressThresholds()
@@ -204,10 +210,10 @@ class CoordinatorAgent:
 
         result = RiskAnalysisResult.model_validate(final["result"])
         logger.info(
-            "pipeline end audit=%s stress=%s heps=%.4f phases=%s",
+            "pipeline end audit=%s stress=%s heps=%s phases=%s",
             result.audit_status,
             result.grid_stress_level,
-            result.heps_score,
+            "withheld" if result.heps_score is None else f"{result.heps_score:.4f}",
             final.get("phases", []),
         )
         return result
@@ -251,6 +257,7 @@ class CoordinatorAgent:
             )
             return {
                 "error": f"gather_satellite failed: {type(exc).__name__}: {exc}",
+                "failed_stage": "gather_satellite",
                 "phases": [*state.get("phases", []), "gather_satellite"],
             }
 
@@ -290,16 +297,20 @@ class CoordinatorAgent:
             )
             return {
                 "error": f"gather_vulnerability failed: {type(exc).__name__}: {exc}",
+                "failed_stage": "gather_vulnerability",
                 "phases": [*state.get("phases", []), "gather_vulnerability"],
             }
 
         logger.info(
-            "phase=gather_vulnerability done density=%.1f svi=%.3f",
+            "phase=gather_vulnerability done provenance=%s density=%s svi=%s",
+            context.provenance.value,
             context.population_density,
             context.social_vulnerability,
         )
         return {
             "vulnerability": {
+                "provenance": context.provenance.value,
+                "source": context.source,
                 "population_density": context.population_density,
                 "social_vulnerability": context.social_vulnerability,
             },
@@ -317,7 +328,12 @@ class CoordinatorAgent:
         """
         logger.info("phase=assess start")
         layer = state.get("layer")
-        context = VulnerabilityContext(**state["vulnerability"])
+        context = VulnerabilityContext(
+            provenance=EvidenceProvenance(state["vulnerability"]["provenance"]),
+            source=state["vulnerability"]["source"],
+            population_density=state["vulnerability"]["population_density"],
+            social_vulnerability=state["vulnerability"]["social_vulnerability"],
+        )
 
         # Translate tool sentinels into explicit "unavailable" so the risk
         # engine renormalises instead of scoring a placeholder as a real 0.
@@ -352,23 +368,48 @@ class CoordinatorAgent:
 
         for note in assessment.notes:
             logger.warning("phase=assess incomplete: %s", note)
+
+        heps_score = assessment.heps_score
+        stress_level = assessment.stress_level.value if assessment.stress_level else None
+        audit_status = assessment.recommended_audit_status
+        notes = list(assessment.notes)
+
+        # Independent check on the conclusion before it leaves this phase.
+        violations = audit_conclusion(
+            heps_score=heps_score,
+            stress_level=stress_level,
+            audit_status=audit_status,
+            data_complete=assessment.data_complete,
+            vulnerability_provenance=context.provenance,
+            satellite_provenance=_satellite_provenance(layer),
+        )
+        if violations:
+            logger.error("phase=assess auditor blocked conclusion: %s", violations)
+            heps_score = None
+            stress_level = None
+            audit_status = AuditStatus.INSUFFICIENT_EVIDENCE.value
+            notes.extend(f"auditor blocked conclusion: {v}" for v in violations)
+
         logger.info(
-            "phase=assess done heps=%.4f stress=%s complete=%s",
-            assessment.heps_score,
-            assessment.stress_level.value,
+            "phase=assess done heps=%s stress=%s audit=%s complete=%s",
+            "withheld" if heps_score is None else f"{heps_score:.4f}",
+            stress_level,
+            audit_status,
             assessment.data_complete,
         )
         return {
             "assessment": {
-                "heps_score": assessment.heps_score,
-                "stress_level": assessment.stress_level.value,
-                "audit_status": assessment.recommended_audit_status,
+                "heps_score": heps_score,
+                "stress_level": stress_level,
+                "audit_status": audit_status,
                 "data_complete": assessment.data_complete,
-                "notes": list(assessment.notes),
+                "notes": notes,
                 "weights_used": assessment.weights_used,
                 "heat_exposure": assessment.factors.heat_exposure,
                 "cooling_deficit": assessment.factors.cooling_deficit,
                 "vulnerability": assessment.factors.vulnerability,
+                "vulnerability_provenance": context.provenance.value,
+                "vulnerability_source": context.source,
             },
             "phases": [*state.get("phases", []), "assess"],
         }
@@ -389,25 +430,39 @@ class CoordinatorAgent:
         assessment = state.get("assessment")
         error = state.get("error")
         phases = [*state.get("phases", []), "consolidate"]
+        layer = state.get("layer")
+        evidence = _evidence_items(state)
 
         if error:
             logger.error("phase=consolidate producing failed result: %s", error)
+            # No score and no stress class: a failed run must not look like a
+            # low-risk area, and 0.0 would read as a measurement.
             result = RiskAnalysisResult(
-                heps_score=0.0,
-                grid_stress_level=GridStressLevel.LOW.value,
+                heps_score=None,
+                grid_stress_level=None,
                 geojson_features=_empty_collection(request.bbox, error),
                 audit_status=AuditStatus.FAILED.value,
+                evidence_status=EvidenceStatus.FAILED.value,
+                evidence=evidence,
             )
             return {"result": result.model_dump(), "phases": phases}
 
         # _assess always populates this when there is no error.
         assert assessment is not None, "assess must run before consolidate without an error"
-        layer = state.get("layer")
+        heps_score = assessment["heps_score"]
+        if heps_score is None:
+            evidence_status = EvidenceStatus.INSUFFICIENT
+        elif assessment["data_complete"]:
+            evidence_status = EvidenceStatus.COMPLETE
+        else:
+            evidence_status = EvidenceStatus.PARTIAL
         result = RiskAnalysisResult(
-            heps_score=assessment["heps_score"],
+            heps_score=heps_score,
             grid_stress_level=assessment["stress_level"],
-            geojson_features=_feature_collection(request, layer, assessment),
+            geojson_features=_feature_collection(request, layer, assessment, evidence_status),
             audit_status=assessment["audit_status"],
+            evidence_status=evidence_status.value,
+            evidence=evidence,
         )
         logger.info("phase=consolidate done audit=%s", result.audit_status)
         return {"result": result.model_dump(), "phases": phases}
@@ -438,10 +493,75 @@ def _bbox_polygon(bbox: Sequence[float]) -> dict[str, Any]:
     return {"type": "Polygon", "coordinates": [ring]}
 
 
+def _satellite_provenance(layer: dict[str, Any] | None) -> EvidenceProvenance | None:
+    """Classify the satellite layer. ``None`` when no layer was produced.
+
+    A retrieved scene is ``VERIFIED`` only if it carries an identifier and a
+    computed NDVI. Anything less is reported as ``MISSING`` or ``INVALID``.
+    """
+    if layer is None:
+        return None
+    if layer["stac_id"] == UNAVAILABLE_STAC_ID:
+        return EvidenceProvenance.MISSING
+    if layer["ndvi_mean"] == NDVI_NO_DATA:
+        return EvidenceProvenance.INVALID
+    return EvidenceProvenance.VERIFIED
+
+
+def _evidence_items(state: PipelineState) -> list[EvidenceItem]:
+    """Describe each evidence stream's provenance for the final result."""
+    failed_stage = state.get("failed_stage")
+    layer = state.get("layer")
+    items: list[EvidenceItem] = []
+
+    if failed_stage == "gather_satellite":
+        sat = EvidenceProvenance.FAILED
+        sat_detail = str(state.get("error", "satellite retrieval failed"))
+    elif layer is None:
+        sat = EvidenceProvenance.MISSING
+        sat_detail = "satellite stage did not run"
+    else:
+        sat = _satellite_provenance(layer) or EvidenceProvenance.MISSING
+        sat_detail = (
+            f"scene {layer['stac_id']}"
+            if sat is EvidenceProvenance.VERIFIED
+            else "no usable scene or NDVI"
+        )
+    items.append(EvidenceItem(source="satellite", provenance=sat.value, detail=sat_detail))
+
+    vulnerability = state.get("vulnerability")
+    if failed_stage == "gather_vulnerability":
+        items.append(
+            EvidenceItem(
+                source="demographics",
+                provenance=EvidenceProvenance.FAILED.value,
+                detail=str(state.get("error", "demographic retrieval failed")),
+            )
+        )
+    elif vulnerability is None:
+        items.append(
+            EvidenceItem(
+                source="demographics",
+                provenance=EvidenceProvenance.MISSING.value,
+                detail="demographic stage did not run",
+            )
+        )
+    else:
+        items.append(
+            EvidenceItem(
+                source="demographics",
+                provenance=vulnerability["provenance"],
+                detail=vulnerability["source"],
+            )
+        )
+    return items
+
+
 def _feature_collection(
     request: SpatialQueryRequest,
     layer: dict[str, Any] | None,
     assessment: dict[str, Any],
+    evidence_status: EvidenceStatus,
 ) -> dict[str, Any]:
     """Build the GeoJSON FeatureCollection describing the verdict.
 
@@ -449,6 +569,7 @@ def _feature_collection(
         request: The query the verdict answers.
         layer: Satellite metrics, if any were retrieved.
         assessment: The HEPS payload.
+        evidence_status: Overall evidence position for this verdict.
 
     Returns:
         A GeoJSON FeatureCollection with a single feature covering the bbox.
@@ -460,6 +581,7 @@ def _feature_collection(
         "heps_score": assessment["heps_score"],
         "grid_stress_level": assessment["stress_level"],
         "data_complete": assessment["data_complete"],
+        "evidence_status": evidence_status.value,
         "notes": assessment["notes"],
         "weights_used": assessment["weights_used"],
         "factors": {

@@ -14,6 +14,8 @@ from app.services.risk_service import (
     POPULATION_DENSITY_MAX,
     RiskComputationError,
     RiskWeights,
+    EvidenceProvenance,
+    MissingVulnerabilityProvider,
     StaticVulnerabilityProvider,
     StressThresholds,
     VulnerabilityContext,
@@ -23,8 +25,13 @@ from app.services.risk_service import (
 
 
 def ctx(density: float = 5_000.0, svi: float = 0.5) -> VulnerabilityContext:
-    """A demographic context with sensible mid-to-high exposure."""
-    return VulnerabilityContext(density, svi)
+    """A *verified* demographic context with sensible mid-to-high exposure."""
+    return VulnerabilityContext(
+        provenance=EvidenceProvenance.VERIFIED,
+        source="test fixture",
+        population_density=density,
+        social_vulnerability=svi,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -89,15 +96,28 @@ class TestVulnerabilityContext:
 
     def test_negative_density_rejected(self) -> None:
         with pytest.raises(RiskComputationError):
-            VulnerabilityContext(-1.0)
+            ctx(density=-1.0)
 
     @pytest.mark.parametrize("svi", [-0.1, 1.1])
     def test_out_of_range_svi_rejected(self, svi: float) -> None:
         with pytest.raises(RiskComputationError):
-            VulnerabilityContext(1000.0, svi)
+            ctx(svi=svi)
 
-    def test_defaults(self) -> None:
-        assert VulnerabilityContext(0.0).social_vulnerability == 0.5
+    def test_values_default_to_unknown_not_a_neutral_guess(self) -> None:
+        context = VulnerabilityContext(
+            provenance=EvidenceProvenance.MISSING, source="none"
+        )
+        assert context.population_density is None
+        assert context.social_vulnerability is None
+        assert not context.is_scoreable
+
+    def test_only_verified_complete_contexts_are_scoreable(self) -> None:
+        for provenance in EvidenceProvenance:
+            expected = provenance is EvidenceProvenance.VERIFIED
+            assert (
+                VulnerabilityContext(provenance, "x", 1.0, 0.5).is_scoreable is expected
+            )
+        assert not VulnerabilityContext(EvidenceProvenance.VERIFIED, "x", 1.0).is_scoreable
 
 
 # ---------------------------------------------------------------------------
@@ -263,10 +283,16 @@ class TestVulnerabilityProvider:
     def test_static_provider_satisfies_the_protocol(self) -> None:
         assert isinstance(StaticVulnerabilityProvider(), VulnerabilityProvider)
 
-    async def test_static_provider_returns_neutral_defaults(self) -> None:
+    async def test_static_provider_is_labelled_placeholder_with_no_values(self) -> None:
         context = await StaticVulnerabilityProvider().fetch([0.0, 0.0, 1.0, 1.0])
-        assert context.population_density == 1_000.0
-        assert context.social_vulnerability == 0.5
+        assert context.provenance is EvidenceProvenance.PLACEHOLDER
+        assert context.population_density is None
+        assert context.social_vulnerability is None
+
+    async def test_default_provider_reports_missing_evidence(self) -> None:
+        context = await MissingVulnerabilityProvider().fetch([0.0, 0.0, 1.0, 1.0])
+        assert context.provenance is EvidenceProvenance.MISSING
+        assert not context.is_scoreable
 
     async def test_static_provider_is_area_independent(self) -> None:
         provider = StaticVulnerabilityProvider()
@@ -280,14 +306,31 @@ class TestVulnerabilityProvider:
         assert context.population_density == 2_500.0
         assert context.social_vulnerability == 0.9
 
-    def test_neutral_baseline_blends_to_a_midrange_score(self) -> None:
-        result = compute_heps(lst_celsius=None, ndvi=None, vulnerability=ctx(1_000.0, 0.5))
-        assert result.heps_score == pytest.approx(0.5 * 0.1 + 0.5 * 0.5)
+    def test_placeholder_values_never_produce_a_score(self) -> None:
+        placeholder = VulnerabilityContext(
+            provenance=EvidenceProvenance.PLACEHOLDER,
+            source="static placeholder",
+            population_density=1_000.0,
+            social_vulnerability=0.5,
+        )
+        result = compute_heps(lst_celsius=45.0, ndvi=0.15, vulnerability=placeholder)
+        assert result.heps_score is None
+        assert result.stress_level is None
+        assert result.factors.vulnerability is None
+        assert result.recommended_audit_status == "insufficient_evidence"
+        assert result.vulnerability_provenance is EvidenceProvenance.PLACEHOLDER
+
+    def test_missing_demographics_keep_satellite_components_as_partial_evidence(self) -> None:
+        missing = VulnerabilityContext(EvidenceProvenance.MISSING, "none")
+        result = compute_heps(lst_celsius=None, ndvi=0.15, vulnerability=missing)
+        assert result.heps_score is None
+        assert result.factors.cooling_deficit is not None
 
     def test_density_saturation_cap(self) -> None:
         at_cap = compute_heps(lst_celsius=None, ndvi=None, vulnerability=ctx(POPULATION_DENSITY_MAX, 0.0))
         above_cap = compute_heps(lst_celsius=None, ndvi=None, vulnerability=ctx(1_000_000.0, 0.0))
         assert at_cap.heps_score == above_cap.heps_score == pytest.approx(0.5)
+
 
 class TestNormalisationGuard:
     """The low-level helper's own guards."""

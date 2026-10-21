@@ -41,6 +41,8 @@ from pydantic import (
 
 __all__ = [
     "AuditStatus",
+    "EvidenceItem",
+    "EvidenceStatus",
     "GeometryType",
     "GridStressLevel",
     "RiskAnalysisResult",
@@ -103,6 +105,24 @@ class AuditStatus(StrEnum):
     PASSED = "passed"
     FAILED = "failed"
     ESCALATED = "escalated"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+
+
+class EvidenceStatus(StrEnum):
+    """Overall evidence position of a :class:`RiskAnalysisResult`.
+
+    * ``COMPLETE`` — a score was produced and every component was observed.
+    * ``PARTIAL`` — a score was produced but a component was missing; it is
+      labelled and escalated, never presented as complete.
+    * ``INSUFFICIENT`` — no defensible score: required evidence was missing,
+      synthetic, placeholder or otherwise unverified.
+    * ``FAILED`` — the pipeline could not run to a verdict.
+    """
+
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+    INSUFFICIENT = "insufficient"
+    FAILED = "failed"
 
 
 def _normalize_enum(value: Any, enum_cls: type[StrEnum], field_name: str) -> str:
@@ -347,6 +367,25 @@ class SatelliteLayerMetadata(_StrictModel):
 # ---------------------------------------------------------------------------
 
 
+class EvidenceItem(_StrictModel):
+    """Provenance of one evidence source behind a risk result.
+
+    Attributes:
+        source: Which evidence stream this describes, e.g. ``"demographics"``.
+        provenance: One of the ``EvidenceProvenance`` values, as a string.
+        detail: Human-readable description of the source or the reason it is
+            not usable. Never contains credentials.
+    """
+
+    source: str = Field(description="Evidence stream, e.g. 'demographics' or 'satellite'.")
+    provenance: str = Field(
+        description=(
+            "One of verified, synthetic, placeholder, missing, failed, stale, invalid."
+        ),
+    )
+    detail: str | None = Field(default=None, description="Human-readable detail.")
+
+
 class RiskAnalysisResult(_StrictModel):
     """Verdict produced by the risk-analysis agent for one spatial query.
 
@@ -360,19 +399,23 @@ class RiskAnalysisResult(_StrictModel):
         audit_status: Outcome of the automatic audit of this result.
     """
 
-    heps_score: float = Field(
+    heps_score: float | None = Field(
+        default=None,
         description=(
-            "Composite HEPS score. Unconstrained by design: the producing "
-            "agent owns the scale, and clamping a rescaled index here would "
-            "hide the change rather than surface it."
+            "Composite HEPS score, or null when no defensible score could be "
+            "produced (see evidence_status). Unconstrained by design: the "
+            "producing agent owns the scale, and clamping a rescaled index "
+            "here would hide the change rather than surface it."
         ),
         examples=[0.78],
     )
-    grid_stress_level: str = Field(
+    grid_stress_level: str | None = Field(
+        default=None,
         description=(
             f"Stress class for the grid cell; one of "
-            f"{[level.value for level in GridStressLevel]}. Case-insensitive on "
-            "input, normalised to lowercase on output."
+            f"{[level.value for level in GridStressLevel]}, or null when no "
+            "score was produced. Case-insensitive on input, normalised to "
+            "lowercase on output."
         ),
         examples=["high"],
     )
@@ -389,11 +432,25 @@ class RiskAnalysisResult(_StrictModel):
         ),
         examples=["passed"],
     )
+    evidence_status: EvidenceStatus | None = Field(
+        default=None,
+        description=(
+            f"Overall evidence position; one of {[s.value for s in EvidenceStatus]}. "
+            "Null only for results produced before evidence reporting existed."
+        ),
+        examples=["insufficient"],
+    )
+    evidence: list[EvidenceItem] = Field(
+        default_factory=list,
+        description="Per-source evidence provenance behind this result.",
+    )
 
     @field_validator("grid_stress_level", mode="before")
     @classmethod
-    def _normalize_grid_stress_level(cls, value: Any) -> str:
+    def _normalize_grid_stress_level(cls, value: Any) -> str | None:
         """Map any casing to the canonical :class:`GridStressLevel` value."""
+        if value is None:
+            return None
         return _normalize_enum(value, GridStressLevel, "grid_stress_level")
 
     @field_validator("audit_status", mode="before")

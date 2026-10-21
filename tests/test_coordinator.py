@@ -12,11 +12,13 @@ import pytest
 from app.agents.coordinator import CoordinatorAgent
 from app.core.schemas import (
     AuditStatus,
+    EvidenceStatus,
     GridStressLevel,
     RiskAnalysisResult,
     SpatialQueryRequest,
 )
 from app.services.risk_service import (
+    EvidenceProvenance,
     RiskWeights,
     StressThresholds,
     VulnerabilityContext,
@@ -99,7 +101,12 @@ class StubVulnerability:
     def __init__(
         self, density: float = 8_000.0, svi: float = 0.8, exc: Exception | None = None
     ) -> None:
-        self.context = VulnerabilityContext(density, svi)
+        self.context = VulnerabilityContext(
+            provenance=EvidenceProvenance.VERIFIED,
+            source="test stub",
+            population_density=density,
+            social_vulnerability=svi,
+        )
         self.exc = exc
         self.calls: list[Any] = []
 
@@ -165,7 +172,9 @@ class TestExecutePipeline:
         expected = compute_heps(
             lst_celsius=None,  # Sentinel-2 supplies no thermal band
             ndvi=0.15,
-            vulnerability=VulnerabilityContext(8_000.0, 0.8),
+            vulnerability=VulnerabilityContext(
+                EvidenceProvenance.VERIFIED, "test stub", 8_000.0, 0.8
+            ),
         )
         assert result.heps_score == pytest.approx(expected.heps_score)
         assert result.grid_stress_level == expected.stress_level.value
@@ -206,14 +215,20 @@ class TestAuditStatus:
 
     async def test_escalated_when_lst_is_absent(self) -> None:
         """The default: Sentinel-2 has no thermal band, so the score is partial."""
-        agent = CoordinatorAgent(satellite_service=StubSatellite())
+        agent = CoordinatorAgent(
+            satellite_service=StubSatellite(), vulnerability_provider=StubVulnerability()
+        )
         result = await agent.execute_pipeline(make_request())
         assert result.audit_status == AuditStatus.ESCALATED.value
 
     async def test_passed_when_every_component_is_observed(self) -> None:
         """A thermal source flips the run to a clean pass."""
         satellite = StubSatellite(make_layer(lst_celsius_max=44.5))
-        agent = CoordinatorAgent(satellite_service=satellite, provides_lst=True)
+        agent = CoordinatorAgent(
+            satellite_service=satellite,
+            provides_lst=True,
+            vulnerability_provider=StubVulnerability(),
+        )
         result = await agent.execute_pipeline(make_request())
         assert result.audit_status == AuditStatus.PASSED.value
         properties = result.geojson_features["features"][0]["properties"]
@@ -223,7 +238,11 @@ class TestAuditStatus:
     async def test_provides_lst_false_ignores_the_placeholder(self) -> None:
         """A 0.0 placeholder must never be scored as 'no heat'."""
         satellite = StubSatellite(make_layer(lst_celsius_max=0.0))
-        agent = CoordinatorAgent(satellite_service=satellite, provides_lst=False)
+        agent = CoordinatorAgent(
+            satellite_service=satellite,
+            provides_lst=False,
+            vulnerability_provider=StubVulnerability(),
+        )
         result = await agent.execute_pipeline(make_request())
         properties = result.geojson_features["features"][0]["properties"]
         assert properties["factors"]["heat_exposure"] is None
@@ -249,8 +268,10 @@ class TestAuditStatus:
         )
         result = await agent.execute_pipeline(make_request())
         assert result.audit_status == AuditStatus.FAILED.value
-        assert result.heps_score == 0.0
-        assert result.grid_stress_level == GridStressLevel.LOW.value
+        # A failed run has no score: 0.0 would read as a measured low risk.
+        assert result.heps_score is None
+        assert result.grid_stress_level is None
+        assert result.evidence_status == EvidenceStatus.FAILED.value
 
     async def test_failed_result_still_describes_the_area(self) -> None:
         agent = CoordinatorAgent(
@@ -279,6 +300,7 @@ class TestAuditStatus:
         """Zero equity weight plus no satellite evidence leaves nothing to blend."""
         agent = CoordinatorAgent(
             satellite_service=StubSatellite(degraded_layer()),
+            vulnerability_provider=StubVulnerability(),
             weights=RiskWeights(heat=0.5, cooling=0.5, vulnerability=0.0),
         )
         result = await agent.execute_pipeline(make_request())
@@ -376,10 +398,12 @@ class TestConfiguration:
         satellite_b = StubSatellite(make_layer())
         lenient = CoordinatorAgent(
             satellite_service=satellite_a,
+            vulnerability_provider=StubVulnerability(),
             thresholds=StressThresholds(moderate=0.9, high=0.95, extreme=0.99),
         )
         strict = CoordinatorAgent(
             satellite_service=satellite_b,
+            vulnerability_provider=StubVulnerability(),
             thresholds=StressThresholds(moderate=0.1, high=0.2, extreme=0.3),
         )
         a = await lenient.execute_pipeline(make_request())
@@ -434,7 +458,9 @@ class TestLogging:
         assert "pipeline end" in text
 
     async def test_pipeline_end_reports_the_verdict(self, caplog) -> None:
-        agent = CoordinatorAgent(satellite_service=StubSatellite())
+        agent = CoordinatorAgent(
+            satellite_service=StubSatellite(), vulnerability_provider=StubVulnerability()
+        )
         with caplog.at_level(logging.INFO, logger=COORDINATOR_LOGGER):
             await agent.execute_pipeline(make_request())
         end = [r.message for r in caplog.records if "pipeline end" in r.message]
@@ -584,3 +610,75 @@ class TestRealComponentWiring:
         # The service degrades rather than raising, so the pipeline degrades too.
         assert result.audit_status == AuditStatus.ESCALATED.value
         assert result.heps_score == pytest.approx(0.8)
+
+
+# ---------------------------------------------------------------------------
+# Evidence integrity
+# ---------------------------------------------------------------------------
+
+
+class _PlaceholderVulnerability:
+    """Returns the explicit placeholder context, as StaticVulnerabilityProvider does."""
+
+    async def fetch(self, bbox: Any) -> VulnerabilityContext:
+        return VulnerabilityContext(
+            provenance=EvidenceProvenance.PLACEHOLDER,
+            source="static placeholder (not a dataset)",
+        )
+
+
+class TestEvidenceIntegrity:
+    """No score, stress class or 'passed' verdict without defensible evidence."""
+
+    async def test_default_pipeline_withholds_the_score(self) -> None:
+        agent = CoordinatorAgent(satellite_service=StubSatellite())
+        result = await agent.execute_pipeline(make_request())
+        assert result.heps_score is None
+        assert result.grid_stress_level is None
+        assert result.audit_status == AuditStatus.INSUFFICIENT_EVIDENCE.value
+        assert result.evidence_status == EvidenceStatus.INSUFFICIENT.value
+        demographics = next(e for e in result.evidence if e.source == "demographics")
+        assert demographics.provenance == "missing"
+
+    async def test_placeholder_demographics_never_become_a_score(self) -> None:
+        agent = CoordinatorAgent(
+            satellite_service=StubSatellite(make_layer(ndvi_mean=0.15)),
+            vulnerability_provider=_PlaceholderVulnerability(),
+        )
+        result = await agent.execute_pipeline(make_request())
+        assert result.heps_score is None
+        assert result.audit_status == AuditStatus.INSUFFICIENT_EVIDENCE.value
+        demographics = next(e for e in result.evidence if e.source == "demographics")
+        assert demographics.provenance == "placeholder"
+        properties = result.geojson_features["features"][0]["properties"]
+        assert properties["factors"]["vulnerability"] is None
+
+    async def test_verified_run_reports_provenance_and_status(self) -> None:
+        agent = CoordinatorAgent(
+            satellite_service=StubSatellite(make_layer(ndvi_mean=0.15)),
+            vulnerability_provider=StubVulnerability(),
+        )
+        result = await agent.execute_pipeline(make_request())
+        assert result.heps_score is not None
+        assert result.audit_status == AuditStatus.ESCALATED.value
+        assert result.evidence_status == EvidenceStatus.PARTIAL.value
+        provenance = {e.source: e.provenance for e in result.evidence}
+        assert provenance == {"satellite": "verified", "demographics": "verified"}
+
+    async def test_satellite_failure_is_reported_as_failed_evidence(self) -> None:
+        agent = CoordinatorAgent(
+            satellite_service=StubSatellite(exc=RuntimeError("boom")),
+            vulnerability_provider=StubVulnerability(),
+        )
+        result = await agent.execute_pipeline(make_request())
+        provenance = {e.source: e.provenance for e in result.evidence}
+        assert provenance["satellite"] == "failed"
+
+    async def test_degraded_satellite_is_reported_as_missing_not_failed(self) -> None:
+        agent = CoordinatorAgent(
+            satellite_service=StubSatellite(degraded_layer()),
+            vulnerability_provider=StubVulnerability(),
+        )
+        result = await agent.execute_pipeline(make_request())
+        provenance = {e.source: e.provenance for e in result.evidence}
+        assert provenance["satellite"] == "missing"
