@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from "react";
-import { CircleMarker, GeoJSON, MapContainer, TileLayer, useMap } from "react-leaflet";
+import { CircleMarker, GeoJSON, MapContainer, TileLayer, ZoomControl, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import type { RiskAnalysisResult } from "../types";
 import { hepsToColor, scaleCssGradient } from "../lib/color";
@@ -66,7 +66,10 @@ export default function HeatMap({
         className="h-full w-full"
         scrollWheelZoom
         attributionControl
+        zoomControl={false}
       >
+        {/* Top-right, so the zoom buttons do not cover the card title at top-left. */}
+        <ZoomControl position="topright" />
         <FitBounds bbox={bbox} />
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>'

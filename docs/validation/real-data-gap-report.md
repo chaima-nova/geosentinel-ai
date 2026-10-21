@@ -18,6 +18,12 @@ that network state, not the quality of the data sources.
 | services1.arcgis.com (ONS boundary service) | no HTTP response (000) |
 | github.com, pypi.org, registry.npmjs.org | reachable |
 
+Re-tested 2026-10-21 in a later session with the same result: data.worldpop.org, dataspace.copernicus.eu,
+assets.publishing.service.gov.uk, opendata.cbs.nl, geoportal.statistics.gov.uk, services1.arcgis.com,
+data.gov.uk, landsatlook.usgs.gov, planetarycomputer.microsoft.com, earth-search.aws.element84.com,
+sentinel-cogs.s3.us-west-2.amazonaws.com, raw.githubusercontent.com, huggingface.co and zenodo.org all returned
+HTTP 000 (no response). files.pythonhosted.org returned 404 on its root, which means it is reachable.
+
 ## Gap status
 
 ### Gap 1: Greater London boundary — **blocked**
@@ -74,8 +80,12 @@ Verified (`/tmp/browser/ui_check.mjs`, exit 0, 2026-10-21):
 - Loading (`loading.mjs`): submit button disabled while the request is pending.
 - Error (`error.mjs`): the real server message is shown in the feed (test-intercepted HTTP 500, labelled as such).
 
+Re-verified 2026-10-21 after the zoom fix (zoom control moved to top-right in `frontend/src/components/HeatMap.tsx`):
+- The map title no longer overlaps the zoom control (measured: title x 489–851 px, zoom x 1299–1333 px at 1440 px width).
+  Screenshot `/tmp/shots/E_map_zoom_fixed.png`, not committed.
+- All other checks above were re-run with the same results.
+
 Defects still open:
-- The zoom controls overlap the map card title "INTERACTIVE LEAFLET MAP — HEAT EXPOSURE" (the "I" is covered).
 - CARTO basemap tiles fail with `ERR_CONNECTION_CLOSED` in this sandbox. This is a network limit, not a fix.
   The map shows no tiles here, so it is not visually verified with a basemap.
 - `/tmp/browser/states.mjs` is a stale combined script that fails with a top-level-await error (exit 13).
