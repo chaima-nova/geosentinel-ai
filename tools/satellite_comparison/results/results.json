@@ -1,0 +1,49 @@
+{
+  "label": "SYNTHETIC SCENE - not a Copernicus product",
+  "size_px": 200,
+  "seed": 7,
+  "truth_ndvi_native": 0.537069,
+  "scene_cloud_percent_scl": 1.69,
+  "scl_masked_fraction_on_sample_grid": 0.124444,
+  "methods": {
+    "legacy_raw_dn": {
+      "ndvi": 0.385152,
+      "abs_error": 0.151917,
+      "valid_coverage": null,
+      "offset_applied": 0.0,
+      "mask": "none"
+    },
+    "offset_only": {
+      "ndvi": 0.573299,
+      "abs_error": 0.03623,
+      "valid_coverage": 1.0,
+      "offset_applied": -1000.0,
+      "mask": "none"
+    },
+    "corrected": {
+      "ndvi": null,
+      "abs_error": null,
+      "valid_coverage": 0.875556,
+      "offset_applied": -1000.0,
+      "mask": "SCL",
+      "min_valid_coverage": 0.9,
+      "withheld_by_coverage_gate": true
+    },
+    "corrected_min_coverage_0.8": {
+      "ndvi": 0.544301,
+      "abs_error": 0.007232,
+      "valid_coverage": 0.875556,
+      "offset_applied": -1000.0,
+      "mask": "SCL",
+      "min_valid_coverage": 0.8,
+      "withheld_by_coverage_gate": false
+    }
+  },
+  "notes": [
+    "Truth is the mean NDVI over clear native-resolution pixels.",
+    "Methods average on the decimated sample grid, so a small gap to truth is expected even when correct.",
+    "legacy_raw_dn and offset_only have no mask: the no-data strip (DN 0) and cloud/shadow are averaged in.",
+    "The coverage gate withholds NDVI below min_valid_coverage; the 0.8 row shows the estimate behind that decision.",
+    "No live Copernicus or Earth Search data was used; no odc-stac comparison was run."
+  ]
+}
