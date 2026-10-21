@@ -13,6 +13,14 @@ const AUDIT_STYLES: Record<string, string> = {
   escalated: "bg-amber-500/15 text-amber-300 ring-amber-500/40",
   failed: "bg-rose-500/15 text-rose-300 ring-rose-500/40",
   pending: "bg-zinc-500/15 text-zinc-300 ring-zinc-500/40",
+  insufficient_evidence: "bg-amber-500/15 text-amber-300 ring-amber-500/40",
+};
+
+const EVIDENCE_STYLES: Record<string, string> = {
+  complete: "bg-emerald-500/15 text-emerald-300 ring-emerald-500/40",
+  partial: "bg-amber-500/15 text-amber-300 ring-amber-500/40",
+  insufficient: "bg-amber-500/15 text-amber-300 ring-amber-500/40",
+  failed: "bg-rose-500/15 text-rose-300 ring-rose-500/40",
 };
 
 function Badge({ label, value, styles }: { label: string; value: string; styles: string }) {
@@ -36,8 +44,10 @@ export default function MetricsHeader({
   loading: boolean;
 }) {
   const heps = result?.heps_score;
+  const scoreAvailable = typeof heps === "number";
   const stress = result?.grid_stress_level ?? "—";
   const audit = result?.audit_status ?? "—";
+  const evidence = result?.evidence_status ?? "—";
 
   return (
     <header className="flex flex-wrap items-stretch gap-4 rounded-2xl border border-fuchsia-500/20 bg-zinc-950/70 p-4 backdrop-blur">
@@ -49,14 +59,14 @@ export default function MetricsHeader({
               loading ? "animate-pulse text-fuchsia-300" : "text-fuchsia-400"
             }`}
           >
-            {heps === undefined ? "–.–" : heps.toFixed(2)}
+            {scoreAvailable ? heps.toFixed(2) : result ? "withheld" : "–.–"}
           </span>
-          <span className="text-sm text-zinc-500">/ 1.00</span>
+          {scoreAvailable && <span className="text-sm text-zinc-500">/ 1.00</span>}
         </div>
         <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
           <div
             className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-fuchsia-500 transition-all duration-700"
-            style={{ width: `${Math.round((heps ?? 0) * 100)}%` }}
+            style={{ width: scoreAvailable ? `${Math.round(heps * 100)}%` : "0%" }}
           />
         </div>
       </div>
@@ -70,6 +80,11 @@ export default function MetricsHeader({
         label="Audit Status:"
         value={audit}
         styles={AUDIT_STYLES[audit] ?? "bg-zinc-500/15 text-zinc-300 ring-zinc-500/40"}
+      />
+      <Badge
+        label="Evidence:"
+        value={evidence}
+        styles={EVIDENCE_STYLES[evidence] ?? "bg-zinc-500/15 text-zinc-300 ring-zinc-500/40"}
       />
     </header>
   );

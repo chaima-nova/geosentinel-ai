@@ -18,9 +18,10 @@ export interface HeatFeatureProperties {
   query?: string;
   start_date?: string;
   end_date?: string;
-  heps_score?: number;
-  grid_stress_level?: string;
+  heps_score?: number | null;
+  grid_stress_level?: string | null;
   data_complete?: boolean;
+  evidence_status?: EvidenceStatus | null;
   notes?: string[];
   stac_id?: string;
   cloud_cover?: number;
@@ -45,11 +46,25 @@ export interface GeoJsonFeatureCollection {
   features: GeoJsonFeature[];
 }
 
+// Mirrors app.core.schemas.EvidenceStatus. "insufficient" = no defensible score.
+export type EvidenceStatus = "complete" | "partial" | "insufficient" | "failed";
+
+// Mirrors app.core.schemas.EvidenceItem. provenance is one of
+// verified | synthetic | placeholder | missing | failed | stale | invalid.
+export interface EvidenceItem {
+  source: string;
+  provenance: string;
+  detail: string | null;
+}
+
 export interface RiskAnalysisResult {
-  heps_score: number;
-  grid_stress_level: string;
+  // null when no defensible score exists: never render it as 0.
+  heps_score: number | null;
+  grid_stress_level: string | null;
   geojson_features: GeoJsonFeatureCollection;
   audit_status: string;
+  evidence_status?: EvidenceStatus | null;
+  evidence?: EvidenceItem[];
 }
 
 export interface HealthResponse {

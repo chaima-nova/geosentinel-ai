@@ -30,10 +30,12 @@ export default function HeatMap({
   bbox: BBox;
   seed: string;
 }) {
-  const baseHeps = result?.heps_score ?? 0;
+  // No score means no overlay. Substituting 0 would paint the area as safe.
+  const baseHeps: number | null = result?.heps_score ?? null;
+  const scoreWithheld = result !== null && baseHeps === null;
 
   const field: HeatField | null = useMemo(
-    () => (result ? buildHeatField(bbox, baseHeps, seed) : null),
+    () => (result && baseHeps !== null ? buildHeatField(bbox, baseHeps, seed) : null),
     [result, bbox, baseHeps, seed],
   );
 
@@ -71,7 +73,7 @@ export default function HeatMap({
           url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
         />
 
-        {collection && (
+        {collection && baseHeps !== null && (
           <GeoJSON
             key={`${seed}-${baseHeps.toFixed(3)}`}
             data={collection}
@@ -120,6 +122,18 @@ export default function HeatMap({
       {!result && (
         <div className="absolute inset-x-0 top-12 z-[1000] mx-auto w-fit rounded-full border border-zinc-800 bg-zinc-950/80 px-4 py-1 text-xs text-zinc-400">
           Run a query to render the heat overlay
+        </div>
+      )}
+
+      {scoreWithheld && (
+        <div className="absolute inset-x-0 top-12 z-[1000] mx-auto w-fit rounded-full border border-amber-500/40 bg-zinc-950/80 px-4 py-1 text-xs text-amber-300">
+          No overlay: insufficient evidence for a score
+        </div>
+      )}
+
+      {field && (
+        <div className="absolute bottom-3 left-4 z-[1000] rounded bg-zinc-950/80 px-2 py-1 text-[10px] text-zinc-400">
+          Display only: cells are spread around one score, not measured per cell
         </div>
       )}
     </section>

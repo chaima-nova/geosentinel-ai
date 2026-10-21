@@ -64,11 +64,16 @@ export default function App() {
 
         await sleep(500);
         setDag((d) => ({ ...d, reasoning: "success", auditor: "running" }));
-        push(`[${ts()}] risk-reasoning: HEPS=${res.heps_score.toFixed(2)} stress=${res.grid_stress_level}`);
+        const scoreLabel = res.heps_score === null ? "withheld" : res.heps_score.toFixed(2);
+        push(`[${ts()}] risk-reasoning: HEPS=${scoreLabel} stress=${res.grid_stress_level ?? "n/a"}`);
 
         await sleep(400);
         const auditNode =
-          res.audit_status === "passed" ? "success" : res.audit_status === "escalated" ? "warning" : "failed";
+          res.audit_status === "passed"
+            ? "success"
+            : res.audit_status === "escalated" || res.audit_status === "insufficient_evidence"
+              ? "warning"
+              : "failed";
         setDag((d) => ({ ...d, auditor: auditNode }));
         setNotes((n) => ({ ...n, reasoning: "HEPS computed", auditor: res.audit_status }));
         push(`[${ts()}] sentinel-auditor: verdict=${res.audit_status}`);
