@@ -1,13 +1,10 @@
 import { useState } from "react";
 import type { SpatialQueryRequest } from "../types";
+import { type BBox, STUDY_AREAS, defaultArea, roleLabel } from "../lib/studyAreas";
 
-type BBox = [number, number, number, number];
-
-const PRESETS: Array<{ label: string; bbox: BBox }> = [
-  { label: "El Oued, Algeria", bbox: [6.6, 33.2, 7.1, 33.7] },
-  { label: "Ouargla Zone, Algeria", bbox: [5.1, 31.7, 5.6, 32.2] },
-  { label: "Algiers, Algeria", bbox: [2.9, 36.6, 3.2, 36.9] },
-];
+// Presets come from config/study_areas.json. Areas without a verified bbox are listed
+// as unavailable, with their reason, and cannot be submitted.
+const PRESETS = STUDY_AREAS;
 
 const inputCls =
   "w-full rounded-lg border border-zinc-800 bg-zinc-900/80 px-2.5 py-1.5 text-sm text-zinc-100 " +
@@ -25,11 +22,14 @@ export default function QueryPanel({
   const [query, setQuery] = useState(
     "Assess heat-island exposure and energy-grid load for industrial corridors during extreme weather",
   );
-  const [bbox, setBbox] = useState<BBox>(PRESETS[0].bbox);
+  const initial = defaultArea();
+  const [areaId, setAreaId] = useState<string>(initial.id);
+  const [bbox, setBbox] = useState<BBox>(initial.bbox as BBox);
   const [start, setStart] = useState("2026-06-01");
   const [end, setEnd] = useState("2026-08-31");
 
   const setCoord = (index: number, value: number) => {
+    setAreaId(""); // a hand-edited box is no longer the named study area
     setBbox((prev) => {
       const next = [...prev] as BBox;
       next[index] = value;
@@ -68,18 +68,39 @@ export default function QueryPanel({
         <select
           id="preset"
           className={inputCls}
+          value={areaId}
           onChange={(e) => {
-            const preset = PRESETS.find((p) => p.label === e.target.value);
-            if (preset) setBbox(preset.bbox);
+            const preset = PRESETS.find((p) => p.id === e.target.value);
+            if (preset && preset.bbox !== null) {
+              setAreaId(preset.id);
+              setBbox(preset.bbox);
+            }
           }}
-          defaultValue={PRESETS[0].label}
         >
+          {areaId === "" && (
+            <option value="" disabled>
+              Custom bounding box
+            </option>
+          )}
           {PRESETS.map((p) => (
-            <option key={p.label} value={p.label}>
+            <option key={p.id} value={p.id} disabled={p.bbox === null}>
               {p.label}
+              {p.bbox === null ? " — unavailable" : ""}
             </option>
           ))}
         </select>
+        {(() => {
+          const selected = PRESETS.find((p) => p.id === areaId);
+          if (!selected) return null;
+          return (
+            <p className="mt-1 text-[11px] leading-snug text-zinc-500">
+              {roleLabel(selected.role)}.{" "}
+              {selected.bbox === null
+                ? selected.unavailable_reason
+                : selected.bbox_basis ?? ""}
+            </p>
+          );
+        })()}
 
         <div className="mt-2 grid grid-cols-2 gap-2">
           <div>

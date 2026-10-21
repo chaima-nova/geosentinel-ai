@@ -2,10 +2,12 @@ import { useCallback, useRef, useState } from "react";
 import AgentWorkflowDAG from "./components/AgentWorkflowDAG";
 import ExecutionFeed from "./components/ExecutionFeed";
 import HeatMap from "./components/HeatMap";
+import EvidencePanel from "./components/EvidencePanel";
 import MetricsHeader from "./components/MetricsHeader";
 import QueryPanel from "./components/QueryPanel";
 import { ApiError, describeValidation, runQuery } from "./api";
 import { INITIAL_DAG, type DagState, type NodeId, type RiskAnalysisResult, type SpatialQueryRequest } from "./types";
+import { defaultArea } from "./lib/studyAreas";
 
 type BBox = [number, number, number, number];
 
@@ -18,7 +20,7 @@ export default function App() {
   const [dag, setDag] = useState<DagState>(INITIAL_DAG);
   const [notes, setNotes] = useState<Partial<Record<NodeId, string>>>({});
   const [feed, setFeed] = useState<string[]>([]);
-  const [bbox, setBbox] = useState<BBox>([6.6, 33.2, 7.1, 33.7]);
+  const [bbox, setBbox] = useState<BBox>(defaultArea().bbox as BBox);
   const [seed, setSeed] = useState("initial");
   const busy = useRef(false);
 
@@ -129,6 +131,7 @@ export default function App() {
 
           <div className="flex flex-col gap-4">
             <MetricsHeader result={result} loading={loading} />
+            <EvidencePanel result={result} bbox={bbox} />
             <div className="h-[520px]">
               <HeatMap result={result} bbox={bbox} seed={seed} />
             </div>
