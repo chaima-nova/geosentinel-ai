@@ -14,7 +14,15 @@
       "country_iso3": "GBR",
       "role": "primary_pilot",
       "bbox": [-0.51, 51.28, 0.34, 51.7],
-      "bbox_basis": "Approximate envelope rounded outward from public extreme-point descriptions of Greater London (Crews Hill north, Ditches Lane south, North Ockendon east, M25 junction 14 west). Not verified against the ONS/GLA boundary polygon. Validation must use the boundary before results are reported as city-wide.",
+      "bbox_basis": "Approximate envelope rounded outward from public extreme-point descriptions of Greater London (Crews Hill north, Ditches Lane south, North Ockendon east, M25 junction 14 west). Not verified against the ONS/GLA boundary polygon. It is a catalogue-search extent only, not the municipal boundary. Validation must use the boundary before results are reported as city-wide.",
+      "boundary": {
+        "status": "not_obtained",
+        "file": null,
+        "sha256": null,
+        "source": null,
+        "licence": null,
+        "reason": "Official Greater London boundary not obtained: ONS/data.gov.uk endpoints were unreachable from the build environment. No polygon has been substituted. See docs/data/vulnerability-dataset-selection.md."
+      },
       "validation": "not_validated",
       "validation_blockers": [
         "WorldPop Global2 GBR raster not downloaded in this environment (data hosts unreachable)",
@@ -29,6 +37,7 @@
       "role": "secondary_pilot",
       "bbox": null,
       "unavailable_reason": "Municipal extent not verified. Set it from the CBS municipal boundary (Wijk- en Buurtkaart 2024, gemeenten layer) before any query.",
+      "boundary": { "status": "not_obtained", "file": null, "sha256": null, "source": null, "licence": null, "reason": "CBS endpoints unreachable from the build environment." },
       "validation": "not_started",
       "validation_blockers": [
         "Runs only after London passes its documented checks; no result transfers from London automatically"
@@ -41,6 +50,7 @@
       "role": "expansion_candidate",
       "bbox": null,
       "unavailable_reason": "Municipal extent not verified. Set it from the CBS municipal boundary (Wijk- en Buurtkaart 2024, gemeenten layer) before any query.",
+      "boundary": { "status": "not_obtained", "file": null, "sha256": null, "source": null, "licence": null, "reason": "CBS endpoints unreachable from the build environment." },
       "validation": "not_started",
       "validation_blockers": [
         "Runs only after Amsterdam; third-city expansion candidate"

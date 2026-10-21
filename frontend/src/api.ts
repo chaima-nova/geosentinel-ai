@@ -56,7 +56,17 @@ export function describeValidation(detail: unknown): string {
       })
       .join("; ");
   }
-  return String(detail);
+  if (typeof detail === "string") return detail;
+  // Error bodies arrive as {"detail": ...}; unwrap them before formatting.
+  if (detail !== null && typeof detail === "object" && "detail" in detail) {
+    return describeValidation((detail as { detail: unknown }).detail);
+  }
+  if (detail === null || detail === undefined) return "no detail returned";
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return "unreadable error detail";
+  }
 }
 
 async function safeJson(response: Response): Promise<unknown> {

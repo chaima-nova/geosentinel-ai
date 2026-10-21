@@ -94,11 +94,11 @@ export default function EvidencePanel({
         </h2>
         {area ? (
           <span className="text-xs text-zinc-400">
-            {area.label} · {roleLabel(area.role)} · {validationLabel(area.validation)}
+            Last query: {area.label} · {roleLabel(area.role)} · {validationLabel(area.validation)}
           </span>
         ) : (
           <span className="text-xs text-zinc-400">
-            Custom bounding box · not a configured study area, so no pilot validation applies
+            Last query: custom bounding box · not a configured study area, so no pilot validation applies
           </span>
         )}
       </div>
