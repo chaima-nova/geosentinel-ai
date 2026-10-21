@@ -20,6 +20,7 @@ from rasterio.transform import from_bounds
 from app.services.satellite_service import BandSample, SatelliteDataService
 
 STAC_SEARCH_PATH = "/search"
+SCL_HREF = "https://eodata.dataspace.copernicus.eu/SCL.jp2"
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +80,10 @@ def make_item(
             assets["tile_1"] = {"href": nir_href}
     elif asset_style != "none":
         raise AssertionError(f"unknown asset_style {asset_style!r}")
+
+    if asset_style != "none":
+        # Scene classification layer. All-vegetation by default (see stub_bands).
+        assets["SCL"] = {"href": SCL_HREF, "title": "Scene classification"}
 
     if extra_assets:
         assets.update(extra_assets)

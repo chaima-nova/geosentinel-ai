@@ -36,6 +36,22 @@ Because :class:`~app.core.schemas.SatelliteLayerMetadata` declares
 Callers that need a machine-readable status rather than a sentinel should wrap
 this service; see the module README note.
 
+Reflectance and masking
+-----------------------
+Sentinel-2 L2A digital numbers (DN) are *not* reflectance. From processing
+baseline 04.00 (25 Jan 2022) onward, ``reflectance = (DN + BOA_ADD_OFFSET) /
+QUANTIFICATION_VALUE`` with ``BOA_ADD_OFFSET = -1000`` and
+``QUANTIFICATION_VALUE = 10000``. Earlier baselines have no offset. The baseline
+is read from the STAC item (``s2:processing_baseline``) or from the product name
+(``_N0510_``). If it cannot be determined, NDVI is not computed.
+
+Pixels are excluded from NDVI when the Scene Classification Layer (SCL) marks
+them as no-data, defective, dark, cloud shadow, cloud (medium or high
+probability) or cirrus. Excluded and out-of-footprint pixels are *not* counted
+as vegetation. ``ndvi_valid_coverage`` reports the fraction of the footprint that
+was usable, and an NDVI whose coverage is below ``min_valid_coverage`` is reported
+as ``NDVI_NO_DATA`` rather than as a value.
+
 Known limitations
 -----------------
 * Sentinel-2 carries **no thermal band**, so ``lst_celsius_max`` cannot come
@@ -52,6 +68,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -59,21 +76,31 @@ from functools import partial
 from typing import Any
 
 import httpx
+import numpy as np
 
 from app.core.schemas import SatelliteLayerMetadata, SpatialQueryRequest
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "BOA_ADD_OFFSET_PB04",
+    "DEFAULT_MIN_VALID_COVERAGE",
     "NDVI_NO_DATA",
     "NIR_BAND",
     "RED_BAND",
+    "SCL_INVALID_CLASSES",
     "UNAVAILABLE_STAC_ID",
     "BandSample",
+    "NdviResult",
     "SatelliteDataService",
     "SatelliteServiceError",
+    "boa_add_offset",
+    "compute_ndvi",
     "mean_ndvi",
+    "processing_baseline",
     "read_band_sample",
+    "read_scl_sample",
+    "scl_invalid_mask",
 ]
 
 #: Root of the CDSE STAC API.
@@ -101,6 +128,27 @@ UNAVAILABLE_STAC_ID = "unavailable"
 #: value (bare/water), so pair it with the log record rather than trusting it.
 NDVI_NO_DATA = -1.0
 
+#: Sentinel-2 scene classification layer (SCL), 20 m, one class per pixel.
+SCL_BAND = "SCL"
+SCL_KEYS = ("SCL", "scl")
+#: SCL classes treated as unusable for NDVI: 0 no data, 1 saturated or defective,
+#: 2 dark area, 3 cloud shadow, 8 cloud medium probability, 9 cloud high
+#: probability, 10 thin cirrus. Vegetation (4), bare soil (5), water (6),
+#: unclassified (7) and snow (11) are kept.
+SCL_INVALID_CLASSES: frozenset[int] = frozenset({0, 1, 2, 3, 8, 9, 10})
+
+#: Sentinel-2 L2A quantification value (reflectance = DN / 10000 before offset).
+QUANTIFICATION_VALUE = 10000.0
+#: First processing baseline whose L2A DN carry the BOA additive offset.
+BOA_OFFSET_FIRST_BASELINE = 4.00
+#: BOA_ADD_OFFSET for baseline >= 04.00, per the Copernicus L2A product guide.
+BOA_ADD_OFFSET_PB04 = -1000.0
+
+#: Minimum fraction of the footprint that must be usable for NDVI to be reported.
+DEFAULT_MIN_VALID_COVERAGE = 0.9
+#: How many clear-enough scenes to try before giving up on NDVI.
+DEFAULT_MAX_CANDIDATES = 3
+
 #: ``cloud_cover`` returned when the retrieval failed entirely: "fully opaque",
 #: i.e. nothing usable was observed.
 CLOUD_COVER_UNKNOWN = 100.0
@@ -113,6 +161,21 @@ _VALIDATION_QUERY = "sentinel-2 index retrieval"
 
 #: Type for the pluggable band reader.
 BandReader = Callable[[str], "BandSample"]
+
+
+@dataclass(frozen=True)
+class NdviResult:
+    """Outcome of an NDVI computation over one footprint.
+
+    Attributes:
+        mean: Mean NDVI over usable pixels, or ``None`` if none were usable or
+            the inputs could not be read.
+        valid_coverage: Fraction of the footprint that was usable, in [0, 1],
+            or ``None`` if the inputs could not be read at all.
+    """
+
+    mean: float | None
+    valid_coverage: float | None
 
 
 class SatelliteServiceError(RuntimeError):
@@ -171,9 +234,18 @@ class SatelliteDataService:
         timeout: float = 30.0,
         max_sample_pixels: int = 256,
         band_reader: BandReader | None = None,
+        scl_reader: BandReader | None = None,
+        min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
+        max_candidates: int = DEFAULT_MAX_CANDIDATES,
         transport: httpx.AsyncBaseTransport | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
+        if not 0.0 <= min_valid_coverage <= 1.0:
+            raise SatelliteServiceError(
+                f"min_valid_coverage must be within [0, 1], got {min_valid_coverage}"
+            )
+        if max_candidates < 1:
+            raise SatelliteServiceError(f"max_candidates must be >= 1, got {max_candidates}")
         if not 0.0 <= max_cloud_cover <= 100.0:
             raise SatelliteServiceError(
                 f"max_cloud_cover must be within [0, 100], got {max_cloud_cover}"
@@ -194,6 +266,12 @@ class SatelliteDataService:
         self._band_reader = band_reader or partial(
             read_band_sample, max_sample_pixels=max_sample_pixels
         )
+        # An injected band reader is taken to serve every raster (tests use one
+        # in-memory reader). Production reads the SCL at native resolution, so
+        # class codes are never averaged.
+        self._scl_reader: BandReader = scl_reader or band_reader or read_scl_sample
+        self.min_valid_coverage = min_valid_coverage
+        self.max_candidates = max_candidates
         self._transport = transport
         self._external_client = client
         self._client = client
@@ -237,8 +315,11 @@ class SatelliteDataService:
         Searches the CDSE STAC API for ``self.collection`` scenes intersecting
         ``bbox`` within ``[start_date, end_date]``, discards scenes at or above
         ``max_cloud_cover`` percent cloud, picks the clearest remaining scene,
-        then samples its B04 and B08 bands to compute mean NDVI as
-        ``(NIR - RED) / (NIR + RED)``.
+        then samples its B04, B08 and SCL layers. NDVI is computed from the
+        offset-corrected reflectance ``(DN + offset) / 10000`` over pixels the
+        scene classification layer does not mark as cloud, shadow, cirrus, defective
+        or no-data. The clearest few scenes are tried in turn until one reaches
+        ``min_valid_coverage``.
 
         Args:
             bbox: ``[lon_min, lat_min, lon_max, lat_max]`` in decimal degrees,
@@ -291,26 +372,79 @@ class SatelliteDataService:
             logger.warning("%s over %s", reason, window.bbox_wkt)
             return self._degraded_metadata(reason)
 
-        item = candidates[0]
-        stac_id = str(item.get("id") or UNAVAILABLE_STAC_ID)
-        cloud_cover = self._cloud_cover(item)
-        band_links = self._resolve_bands(item)
-        logger.info(
-            "selected scene %s (cloud cover %.1f%%) with bands %s",
-            stac_id,
-            cloud_cover,
-            sorted(band_links) or "none",
-        )
+        # Try the clearest few scenes. Keep the first whose usable coverage meets
+        # the threshold; otherwise report the best attempt, flagged as no-data.
+        best: tuple[dict[str, Any], NdviResult] | None = None
+        for item in candidates[: self.max_candidates]:
+            stac_id = str(item.get("id") or UNAVAILABLE_STAC_ID)
+            band_links = self._resolve_bands(item)
+            baseline = processing_baseline(item)
+            offset = boa_add_offset(baseline)
+            ndvi = await self._safe_ndvi(
+                band_links, self._resolve_scl(item), stac_id, offset
+            )
+            coverage = ndvi.valid_coverage
+            logger.info(
+                "candidate %s: cloud=%.1f%% baseline=%s offset=%s ndvi=%s coverage=%s",
+                stac_id,
+                self._cloud_cover(item),
+                f"{baseline:.2f}" if baseline is not None else "unknown",
+                offset,
+                ndvi.mean,
+                f"{coverage:.3f}" if coverage is not None else "unknown",
+            )
+            if ndvi.mean is not None and coverage is not None and coverage >= self.min_valid_coverage:
+                return self._layer_metadata(
+                    item, stac_id, band_links, ndvi.mean, coverage, baseline, offset
+                ).model_dump()
+            if best is None or (coverage or 0.0) > (best[1].valid_coverage or 0.0):
+                best = (item, ndvi)
 
-        ndvi = await self._safe_mean_ndvi(band_links, stac_id)
-        metadata = SatelliteLayerMetadata(
+        assert best is not None  # candidates is non-empty here
+        item, ndvi = best
+        stac_id = str(item.get("id") or UNAVAILABLE_STAC_ID)
+        logger.warning(
+            "no candidate reached the %.0f%% valid-coverage threshold; NDVI withheld "
+            "(best coverage %s)",
+            self.min_valid_coverage * 100,
+            f"{ndvi.valid_coverage:.1%}" if ndvi.valid_coverage is not None else "unknown",
+        )
+        baseline = processing_baseline(item)
+        return self._layer_metadata(
+            item,
+            stac_id,
+            self._resolve_bands(item),
+            None,
+            ndvi.valid_coverage,
+            baseline,
+            boa_add_offset(baseline),
+        ).model_dump()
+
+    def _layer_metadata(
+        self,
+        item: dict[str, Any],
+        stac_id: str,
+        band_links: dict[str, str],
+        ndvi_mean: float | None,
+        valid_coverage: float | None,
+        baseline: float | None,
+        offset: float | None,
+    ) -> SatelliteLayerMetadata:
+        """Assemble the layer document for one scene.
+
+        ``ndvi_mean`` of ``None`` is written as ``NDVI_NO_DATA``, so the value is
+        never a sentinel that could be mistaken for measured bare ground.
+        """
+        return SatelliteLayerMetadata(
             stac_id=stac_id,
-            cloud_cover=cloud_cover,
-            ndvi_mean=ndvi if ndvi is not None else NDVI_NO_DATA,
+            cloud_cover=self._cloud_cover(item),
+            ndvi_mean=ndvi_mean if ndvi_mean is not None else NDVI_NO_DATA,
             lst_celsius_max=LST_NOT_AVAILABLE,
             band_links=band_links,
+            ndvi_valid_coverage=valid_coverage,
+            reflectance_offset=offset,
+            processing_baseline=f"{baseline:05.2f}" if baseline is not None else None,
         )
-        return metadata.model_dump()
 
     def _degraded_metadata(self, reason: str) -> dict:
         """Build a sentinel-valued metadata document for a failed retrieval.
@@ -335,6 +469,9 @@ class SatelliteDataService:
             ndvi_mean=NDVI_NO_DATA,
             lst_celsius_max=LST_NOT_AVAILABLE,
             band_links={},
+            ndvi_valid_coverage=None,
+            reflectance_offset=None,
+            processing_baseline=None,
         ).model_dump()
 
     async def search_items(self, window: SpatialQueryRequest) -> list[dict[str, Any]]:
@@ -513,28 +650,58 @@ class SatelliteDataService:
 
     # --- NDVI --------------------------------------------------------------
 
-    async def _safe_mean_ndvi(self, band_links: dict[str, str], stac_id: str) -> float | None:
-        """Compute mean NDVI, converting every failure into ``None``.
+    @staticmethod
+    def _resolve_scl(item: dict[str, Any]) -> str | None:
+        """Locate the scene classification layer href, or ``None``."""
+        assets = item.get("assets")
+        if not isinstance(assets, dict):
+            return None
+        return SatelliteDataService._find_asset_href(assets, SCL_BAND, SCL_KEYS)
 
-        Args:
-            band_links: Resolved band hrefs for the scene.
-            stac_id: Scene identifier, for logging.
+    async def _safe_ndvi(
+        self,
+        band_links: dict[str, str],
+        scl_href: str | None,
+        stac_id: str,
+        offset: float | None,
+    ) -> NdviResult:
+        """Compute coverage-aware NDVI, converting every failure into ``NdviResult(None, None)``.
 
-        Returns:
-            The mean NDVI, or ``None`` if it could not be computed.
+        Refuses to compute NDVI without a cloud mask or a known reflectance offset,
+        because either absence would make the result unsupported.
         """
         missing = [band for band in (RED_BAND, NIR_BAND) if band not in band_links]
         if missing:
             logger.warning(
-                "scene %s is missing band(s) %s; NDVI not computed", stac_id, ", ".join(missing)
+                "scene %s is missing band(s) %s; NDVI not computed",
+                stac_id,
+                ", ".join(missing),
             )
-            return None
+            return NdviResult(None, None)
+        if scl_href is None:
+            logger.warning(
+                "scene %s has no scene classification layer; cloud mask unavailable, "
+                "NDVI not computed",
+                stac_id,
+            )
+            return NdviResult(None, None)
+        if offset is None:
+            logger.warning(
+                "scene %s has an unknown processing baseline; reflectance offset cannot "
+                "be determined, NDVI not computed",
+                stac_id,
+            )
+            return NdviResult(None, None)
 
         try:
             # rasterio is blocking and GDAL does network I/O, so keep it off the
             # event loop.
             return await asyncio.to_thread(
-                self._mean_ndvi, band_links[RED_BAND], band_links[NIR_BAND]
+                self._ndvi,
+                band_links[RED_BAND],
+                band_links[NIR_BAND],
+                scl_href,
+                offset,
             )
         except Exception as exc:  # noqa: BLE001 - any raster failure is non-fatal
             logger.warning(
@@ -543,30 +710,204 @@ class SatelliteDataService:
                 type(exc).__name__,
                 exc,
             )
-            return None
+            return NdviResult(None, None)
 
-    def _mean_ndvi(self, red_href: str, nir_href: str) -> float | None:
-        """Compute mean NDVI from two band hrefs. Blocking; runs in a thread.
+    def _ndvi(
+        self, red_href: str, nir_href: str, scl_href: str, offset: float
+    ) -> NdviResult:
+        """Compute coverage-aware NDVI from band hrefs. Blocking; runs in a thread.
 
         Args:
             red_href: Asset href for the red band.
             nir_href: Asset href for the NIR band.
+            scl_href: Asset href for the scene classification layer.
+            offset: BOA additive offset to apply to DN before scaling.
 
         Returns:
-            Mean NDVI over valid pixels, or ``None`` if no pixel is usable.
+            The :class:`NdviResult` for the footprint.
 
         Raises:
-            Exception: Propagates rasterio/GDAL errors to
-                :meth:`_safe_mean_ndvi`.
+            Exception: Propagates rasterio/GDAL errors to :meth:`_safe_ndvi`.
         """
         red = self._band_reader(red_href)
         nir = self._band_reader(nir_href)
-        return mean_ndvi(red, nir)
+        scl = self._scl_reader(scl_href)
+        invalid = scl_invalid_mask(scl.values, np.shape(red.values))
+        return compute_ndvi(
+            red,
+            nir,
+            reflectance_offset=offset,
+            quantification_value=QUANTIFICATION_VALUE,
+            scl_invalid=invalid,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+
+def processing_baseline(item: dict[str, Any]) -> float | None:
+    """Read the Sentinel-2 processing baseline of a STAC item, e.g. ``5.10``.
+
+    Looks at ``s2:processing_baseline`` first, then at the ``_Nxxyy_`` token in the
+    product identifier. Returns ``None`` when neither is present or parseable.
+    """
+    properties = item.get("properties")
+    if isinstance(properties, dict):
+        value = properties.get("s2:processing_baseline")
+        parsed = _parse_baseline(value)
+        if parsed is not None:
+            return parsed
+    match = re.search(r"_N(\d{2})(\d{2})_", str(item.get("id") or ""))
+    if match:
+        return int(match.group(1)) + int(match.group(2)) / 100.0
+    return None
+
+
+def _parse_baseline(value: Any) -> float | None:
+    """Parse ``"05.10"`` or ``5.1`` style baselines; ``None`` if malformed."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+        return float(value)
+    if isinstance(value, str):
+        try:
+            parsed = float(value.strip())
+        except ValueError:
+            return None
+        return parsed if math.isfinite(parsed) and parsed > 0 else None
+    return None
+
+
+def boa_add_offset(baseline: float | None) -> float | None:
+    """BOA additive offset for a processing baseline.
+
+    Returns:
+        ``-1000`` from baseline 04.00 onward, ``0`` for earlier baselines, and
+        ``None`` when the baseline is unknown (the caller must then not compute NDVI).
+    """
+    if baseline is None:
+        return None
+    return BOA_ADD_OFFSET_PB04 if baseline >= BOA_OFFSET_FIRST_BASELINE - 1e-9 else 0.0
+
+
+def _resample_any(mask: np.ndarray, axis: int, target: int) -> np.ndarray:
+    """Reduce one axis of a boolean mask to ``target`` cells, OR-ing each window.
+
+    A cell is flagged if *any* native pixel under it is flagged. Using "any" rather
+    than nearest-neighbour or mode means a single cloud pixel cannot be dropped.
+    """
+    size = mask.shape[axis]
+    if size == target:
+        return mask
+    if size > target:
+        starts = (np.arange(target) * size) // target
+        return np.logical_or.reduceat(mask, starts, axis=axis)
+    # Upsampling: each target cell maps to one source cell.
+    index = ((np.arange(target) + 0.5) * size // target).astype(int)
+    return np.take(mask, index, axis=axis)
+
+
+def scl_invalid_mask(scl: Any, target_shape: tuple[int, ...]) -> np.ndarray:
+    """Boolean mask of pixels to exclude, resampled to the band grid.
+
+    Args:
+        scl: Scene classification values, at native (or any) resolution.
+        target_shape: Shape of the band samples the mask must align with.
+
+    Returns:
+        ``True`` where the pixel is unusable for NDVI.
+    """
+    import numpy as np
+
+    classes = np.asarray(scl)
+    if classes.ndim != 2 or len(target_shape) != 2:
+        raise SatelliteServiceError("scene classification and band samples must be 2-D")
+    invalid = np.isin(classes, np.fromiter(SCL_INVALID_CLASSES, dtype=classes.dtype))
+    invalid = _resample_any(invalid, 0, target_shape[0])
+    return _resample_any(invalid, 1, target_shape[1])
+
+
+def compute_ndvi(
+    red: BandSample,
+    nir: BandSample,
+    *,
+    reflectance_offset: float,
+    quantification_value: float,
+    scl_invalid: np.ndarray | None,
+) -> NdviResult:
+    """NDVI over a footprint, with explicit usable-pixel coverage.
+
+    Nodata and non-finite DN, plus SCL-invalid pixels, are excluded. The remaining
+    DN are converted to reflectance as ``(DN + offset) / quantification_value``
+    before the ratio. Coverage is the usable fraction of *all* footprint pixels, so
+    out-of-footprint area reduces it.
+
+    Args:
+        red: Sampled red band (DN).
+        nir: Sampled NIR band (DN).
+        reflectance_offset: BOA additive offset (``0`` for pre-04.00 baselines).
+        quantification_value: DN divisor, normally 10000.
+        scl_invalid: Mask of SCL-invalid pixels, or ``None`` if not available.
+
+    Returns:
+        The :class:`NdviResult`. A shape mismatch reports ``NdviResult(None, None)``.
+    """
+    import numpy as np
+
+    red_dn = np.asarray(red.values, dtype="float64")
+    nir_dn = np.asarray(nir.values, dtype="float64")
+    if red_dn.shape != nir_dn.shape:
+        logger.warning(
+            "band shapes differ (red %s vs nir %s); NDVI not computed",
+            red_dn.shape,
+            nir_dn.shape,
+        )
+        return NdviResult(None, None)
+    if scl_invalid is not None and np.shape(scl_invalid) != red_dn.shape:
+        logger.warning("cloud mask shape %s does not match bands; NDVI not computed", np.shape(scl_invalid))
+        return NdviResult(None, None)
+
+    total = red_dn.size
+    usable = np.isfinite(red_dn) & np.isfinite(nir_dn)
+    if red.nodata is not None:
+        usable &= red_dn != float(red.nodata)
+    if nir.nodata is not None:
+        usable &= nir_dn != float(nir.nodata)
+    if scl_invalid is not None:
+        usable &= ~np.asarray(scl_invalid, dtype=bool)
+
+    red_r = (red_dn + reflectance_offset) / quantification_value
+    nir_r = (nir_dn + reflectance_offset) / quantification_value
+    usable &= (nir_r + red_r) != 0
+    count = int(usable.sum())
+    coverage = count / total if total else 0.0
+    if count == 0:
+        logger.warning("no usable pixel in footprint; NDVI not computed")
+        return NdviResult(None, coverage)
+
+    ndvi = (nir_r[usable] - red_r[usable]) / (nir_r[usable] + red_r[usable])
+    return NdviResult(float(np.clip(ndvi.mean(), -1.0, 1.0)), coverage)
+
+
+def read_scl_sample(href: str) -> BandSample:
+    """Read the scene classification layer at native resolution. Blocking.
+
+    Never decimated: resampling would average class codes into meaningless values.
+
+    Args:
+        href: Asset href or local path.
+
+    Returns:
+        A :class:`BandSample` of class codes.
+    """
+    import rasterio
+
+    with rasterio.open(href) as source:
+        if source.height <= 0 or source.width <= 0:
+            raise SatelliteServiceError(f"SCL {href!r} reported an empty extent")
+        return BandSample(values=source.read(1, masked=False), nodata=None)
 
 
 def mean_ndvi(red: BandSample, nir: BandSample) -> float | None:

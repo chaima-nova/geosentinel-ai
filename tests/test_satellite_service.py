@@ -30,6 +30,7 @@ from app.services.satellite_service import (
     read_band_sample,
 )
 from tests.conftest import (
+    SCL_HREF,
     json_handler,
     make_item,
     recording_handler,
@@ -44,10 +45,23 @@ NIR = np.array([[0.5, 0.6], [0.7, 0.8]])
 EXPECTED_NDVI = 0.475
 
 
+def to_dn(reflectance: np.ndarray) -> np.ndarray:
+    """Encode reflectance as L2A digital numbers for baseline >= 04.00.
+
+    ``reflectance = (DN - 1000) / 10000``, so ``DN = reflectance * 10000 + 1000``.
+    """
+    return reflectance * 10000.0 + 1000.0
+
+
 def stub_bands(reader: Any, red: np.ndarray = RED, nir: np.ndarray = NIR) -> None:
-    """Populate an in-memory reader with the default red/NIR stub hrefs."""
-    reader.samples["https://eodata.dataspace.copernicus.eu/B04.jp2"] = BandSample(red)
-    reader.samples["https://eodata.dataspace.copernicus.eu/B08.jp2"] = BandSample(nir)
+    """Populate an in-memory reader with the default red/NIR/SCL stub hrefs.
+
+    Band arrays are reflectance values, encoded as DN. The SCL is all vegetation
+    (class 4), so no pixel is masked unless a test says so.
+    """
+    reader.samples["https://eodata.dataspace.copernicus.eu/B04.jp2"] = BandSample(to_dn(red))
+    reader.samples["https://eodata.dataspace.copernicus.eu/B08.jp2"] = BandSample(to_dn(nir))
+    reader.samples[SCL_HREF] = BandSample(np.full(red.shape, 4, dtype="uint8"))
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +158,16 @@ class TestFetchSentinelIndices:
         async with service:
             result = await service.fetch_sentinel_indices(**valid_window)
         assert isinstance(result, dict)
-        assert set(result) == {"stac_id", "cloud_cover", "ndvi_mean", "lst_celsius_max", "band_links"}
+        assert set(result) == {
+            "stac_id",
+            "cloud_cover",
+            "ndvi_mean",
+            "lst_celsius_max",
+            "band_links",
+            "ndvi_valid_coverage",
+            "reflectance_offset",
+            "processing_baseline",
+        }
 
     async def test_lst_is_placeholder_because_sentinel2_has_no_thermal_band(
         self, service_factory, band_reader, valid_window
@@ -354,6 +377,7 @@ class TestBandResolution:
         item = make_item(asset_style="none", extra_assets={
             "B04": {"alternate": {"s3": {"href": "https://eodata.dataspace.copernicus.eu/B04.jp2"}}},
             "B08": {"alternate": {"s3": {"href": "https://eodata.dataspace.copernicus.eu/B08.jp2"}}},
+            "SCL": {"href": SCL_HREF},
         })
         service = service_factory(stac_response([item]), reader=band_reader)
         async with service:
@@ -508,6 +532,7 @@ class TestFailureHandling:
         stub_bands(band_reader)
         item = make_item()
         del item["id"]
+        item["properties"]["s2:processing_baseline"] = "05.10"  # baseline no longer in the id
         service = service_factory(stac_response([item]), reader=band_reader)
         async with service:
             result = await service.fetch_sentinel_indices(**valid_window)
@@ -660,9 +685,11 @@ class TestRasterioBandReader:
 
     async def test_end_to_end_with_real_rasters(self, service_factory, tmp_path: Path, valid_window) -> None:
         """Full pipeline: mocked STAC, real GeoTIFFs, no injected reader."""
-        red_path = write_geotiff(tmp_path / "b04.tif", RED.astype("float32"), nodata=-9999.0)
-        nir_path = write_geotiff(tmp_path / "b08.tif", NIR.astype("float32"), nodata=-9999.0)
-        item = make_item(red_href=str(red_path), nir_href=str(nir_path))
+        red_path = write_geotiff(tmp_path / "b04.tif", to_dn(RED).astype("float32"), nodata=-9999.0)
+        nir_path = write_geotiff(tmp_path / "b08.tif", to_dn(NIR).astype("float32"), nodata=-9999.0)
+        scl_path = write_geotiff(tmp_path / "scl.tif", np.full(RED.shape, 4, dtype="uint8"))
+        item = make_item(red_href=str(red_path), nir_href=str(nir_path),
+                         extra_assets={"SCL": {"href": str(scl_path)}})
 
         service = service_factory(stac_response([item]))  # default rasterio reader
         async with service:
@@ -684,16 +711,29 @@ class TestRasterioBandReader:
     async def test_nodata_masking_through_the_real_reader(
         self, service_factory, tmp_path: Path, valid_window
     ) -> None:
-        red = RED.astype("float32").copy()
+        red = to_dn(RED).astype("float32").copy()
         red[1, 0] = -9999.0
         red_path = write_geotiff(tmp_path / "b04.tif", red, nodata=-9999.0)
-        nir_path = write_geotiff(tmp_path / "b08.tif", NIR.astype("float32"), nodata=-9999.0)
-        item = make_item(red_href=str(red_path), nir_href=str(nir_path))
+        nir_path = write_geotiff(tmp_path / "b08.tif", to_dn(NIR).astype("float32"), nodata=-9999.0)
+        scl_path = write_geotiff(tmp_path / "scl.tif", np.full(RED.shape, 4, dtype="uint8"))
+        item = make_item(red_href=str(red_path), nir_href=str(nir_path),
+                         extra_assets={"SCL": {"href": str(scl_path)}})
 
+        # One of four footprint pixels is no-data: coverage is 75%, below the 90%
+        # threshold, so NDVI is withheld rather than reported from three pixels.
         service = service_factory(stac_response([item]))
         async with service:
             result = await service.fetch_sentinel_indices(**valid_window)
+        assert result["ndvi_mean"] == NDVI_NO_DATA
+        assert result["ndvi_valid_coverage"] == pytest.approx(0.75)
+
+        # Lowering the threshold makes the same pixels usable: NDVI over the three
+        # valid pixels is (0.6667 + 0.5 + 0.3333) / 3 = 0.5.
+        lenient = service_factory(stac_response([item]), min_valid_coverage=0.5)
+        async with lenient:
+            result = await lenient.fetch_sentinel_indices(**valid_window)
         assert result["ndvi_mean"] == pytest.approx(0.5, abs=1e-6)
+        assert result["ndvi_valid_coverage"] == pytest.approx(0.75)
 
 
 class TestRealTransportFailure:
@@ -793,6 +833,7 @@ class TestDefensiveBranches:
             extra_assets={
                 "RED": {"href": "https://eodata.dataspace.copernicus.eu/B04.jp2"},
                 "NIR": {"href": "https://eodata.dataspace.copernicus.eu/B08.jp2"},
+                "SCL": {"href": SCL_HREF},
             },
         )
         service = service_factory(stac_response([item]), reader=band_reader)

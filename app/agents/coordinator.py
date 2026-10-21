@@ -522,11 +522,16 @@ def _evidence_items(state: PipelineState) -> list[EvidenceItem]:
         sat_detail = "satellite stage did not run"
     else:
         sat = _satellite_provenance(layer) or EvidenceProvenance.MISSING
-        sat_detail = (
-            f"scene {layer['stac_id']}"
-            if sat is EvidenceProvenance.VERIFIED
-            else "no usable scene or NDVI"
-        )
+        coverage = layer.get("ndvi_valid_coverage") if layer else None
+        if sat is EvidenceProvenance.VERIFIED:
+            sat_detail = f"scene {layer['stac_id']}"
+        elif coverage is not None:
+            sat_detail = (
+                f"scene {layer['stac_id']}: only {coverage:.0%} of the footprint usable "
+                "for NDVI; NDVI withheld"
+            )
+        else:
+            sat_detail = "no usable scene or NDVI"
     items.append(EvidenceItem(source="satellite", provenance=sat.value, detail=sat_detail))
 
     vulnerability = state.get("vulnerability")

@@ -34,9 +34,14 @@ from app.services.satellite_service import (
 #: Pixel samples matching the stub hrefs in tests/conftest.py.
 _RED = np.array([[0.1, 0.2], [0.3, 0.4]])
 _NIR = np.array([[0.5, 0.6], [0.7, 0.8]])
+#: Encode reflectance as L2A DN for baseline >= 04.00: DN = rho * 10000 + 1000.
 BAND_SAMPLES = {
-    "https://eodata.dataspace.copernicus.eu/B04.jp2": BandSample(_RED),
-    "https://eodata.dataspace.copernicus.eu/B08.jp2": BandSample(_NIR),
+    "https://eodata.dataspace.copernicus.eu/B04.jp2": BandSample(_RED * 10000.0 + 1000.0),
+    "https://eodata.dataspace.copernicus.eu/B08.jp2": BandSample(_NIR * 10000.0 + 1000.0),
+    # All vegetation (class 4): no pixel is masked.
+    "https://eodata.dataspace.copernicus.eu/SCL.jp2": BandSample(
+        np.full(_RED.shape, 4, dtype="uint8")
+    ),
 }
 #: Mean NDVI the real service derives from those pixels, by hand:
 #:   ((0.4/0.6) + (0.4/0.8) + (0.4/1.0) + (0.4/1.2)) / 4
@@ -565,7 +570,11 @@ class TestRealComponentWiring:
     async def test_full_pipeline_over_the_real_service(self) -> None:
         from tests.conftest import make_item, stac_response
 
-        payload = stac_response([make_item("REAL_SCENE", cloud_cover=3.0)])
+        item = make_item("REAL_SCENE", cloud_cover=3.0)
+        # The baseline is parsed from the product id or this property; "REAL_SCENE"
+        # carries neither, so declare it as a real L2A baseline would.
+        item["properties"]["s2:processing_baseline"] = "05.10"
+        payload = stac_response([item])
         agent = CoordinatorAgent(
             satellite_service=self._service(payload),
             vulnerability_provider=StubVulnerability(8_000.0, 0.8),

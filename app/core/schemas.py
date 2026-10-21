@@ -349,6 +349,31 @@ class SatelliteLayerMetadata(_StrictModel):
         ),
         examples=[{"B04": "https://example.org/B04.jp2", "B08": "https://example.org/B08.jp2"}],
     )
+    ndvi_valid_coverage: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of the footprint whose pixels were usable for NDVI (not "
+            "no-data, not cloud/shadow/cirrus per the scene classification layer). "
+            "Null when the scene could not be read. ndvi_mean is NDVI_NO_DATA when "
+            "this is below the configured minimum."
+        ),
+        examples=[0.97],
+    )
+    reflectance_offset: float | None = Field(
+        default=None,
+        description=(
+            "BOA additive offset applied to DN before scaling by 10000: -1000 for "
+            "processing baseline >= 04.00, 0 for earlier baselines, null if unknown."
+        ),
+        examples=[-1000.0],
+    )
+    processing_baseline: str | None = Field(
+        default=None,
+        description="Sentinel-2 processing baseline, zero-padded, e.g. '05.10'. Null if unknown.",
+        examples=["05.10"],
+    )
 
     @field_validator("band_links", mode="after")
     @classmethod
