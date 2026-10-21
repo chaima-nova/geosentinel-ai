@@ -90,3 +90,103 @@ def test_sidecar_records_licence_and_unverified_checksum(script: ModuleType, tmp
     assert sidecar["licence"].startswith("CC BY 4.0")
     assert sidecar["sha256_verified_against_publisher"] is False
     assert "not a social vulnerability index" in str(sidecar["content"])
+
+
+# --- Manifest-driven areas and coverage (added with the London pilot) -----------
+
+LONDON_BOX = [-0.51, 51.28, 0.34, 51.7]
+
+
+def _extent_raster(path: Path, bounds: tuple[float, float, float, float]) -> Path:
+    west, south, east, north = bounds
+    res = 1 / 1200
+    width = round((east - west) / res)
+    height = round((north - south) / res)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=height,
+        width=width,
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=from_origin(west, north, res, res),
+    ) as destination:
+        destination.write(np.full((1, height, width), 3.0, dtype="float32"))
+    return path
+
+
+def test_validate_raster_accepts_a_raster_that_contains_the_area(script, tmp_path: Path) -> None:
+    raster = _extent_raster(tmp_path / "gb.tif", (-1.0, 51.0, 1.0, 52.0))
+    assert script.validate_raster(raster, area_bbox=LONDON_BOX) == []
+
+
+def test_validate_raster_rejects_a_raster_that_misses_part_of_the_area(script, tmp_path: Path) -> None:
+    raster = _extent_raster(tmp_path / "east.tif", (-0.2, 51.0, 1.0, 52.0))
+    problems = script.validate_raster(raster, area_bbox=LONDON_BOX)
+    assert any("does not contain" in problem for problem in problems)
+
+
+def test_validate_raster_rejects_a_raster_from_another_country(script, tmp_path: Path) -> None:
+    raster = _extent_raster(tmp_path / "dz.tif", (5.0, 31.5, 5.8, 32.4))
+    problems = script.validate_raster(raster, area_bbox=LONDON_BOX)
+    assert any("does not contain" in problem for problem in problems)
+
+
+def test_resolve_area_maps_london_and_refuses_unverified_areas(script) -> None:
+    _key, _dataset, entry, study = script.resolve_area("london")
+    assert entry["iso3"] == "GBR"
+    assert study["bbox"] == LONDON_BOX
+    with pytest.raises(ValueError):
+        script.resolve_area("amsterdam")
+
+
+def test_cli_refuses_an_unverified_area_with_exit_one(script, tmp_path: Path) -> None:
+    assert script.main(["--area", "rotterdam", "--dest", str(tmp_path)]) == 1
+    assert not any(tmp_path.iterdir())
+
+
+def test_cli_download_failure_exits_one_and_writes_nothing(script, tmp_path: Path, monkeypatch) -> None:
+    def fail(url: str, target: Path) -> None:
+        raise OSError("simulated outage")
+
+    monkeypatch.setattr(script, "download", fail)
+    assert script.main(["--area", "london", "--dest", str(tmp_path)]) == 1
+    assert not any(tmp_path.iterdir())
+
+
+def test_cli_accepts_a_local_london_raster_and_records_its_provenance(
+    script, tmp_path: Path
+) -> None:
+    import json
+
+    raster = _extent_raster(tmp_path / "gbr.tif", (-1.0, 51.0, 1.0, 52.0))
+    assert script.main(["--area", "london", "--from-local", str(raster)]) == 0
+    sidecar = json.loads(raster.with_suffix(".source.json").read_text(encoding="utf-8"))
+    assert sidecar["study_area"] == "london"
+    assert sidecar["study_area_bbox"] == LONDON_BOX
+    assert sidecar["licence"] == "CC BY 4.0"
+    assert sidecar["reference_year"] == 2020
+    assert "Global2" in sidecar["dataset"]
+    assert sidecar["url_verified"] is False
+    assert sidecar["sha256_verified_against_publisher"] is False
+    assert sidecar["content"].startswith("population exposure only")
+
+
+def test_cli_keeps_a_local_raster_that_does_not_cover_london_but_refuses_it(
+    script, tmp_path: Path
+) -> None:
+    raster = _extent_raster(tmp_path / "dz.tif", (5.0, 31.5, 5.8, 32.4))
+    assert script.main(["--area", "london", "--from-local", str(raster)]) == 3
+    assert raster.exists()  # the user's file is never deleted by --from-local
+    assert not raster.with_suffix(".source.json").exists()
+
+
+def test_cli_removes_a_downloaded_raster_that_fails_validation(script, tmp_path: Path, monkeypatch) -> None:
+    def fake_download(url: str, target: Path) -> None:
+        _extent_raster(target, (5.0, 31.5, 5.8, 32.4))  # wrong country
+
+    monkeypatch.setattr(script, "download", fake_download)
+    assert script.main(["--area", "london", "--dest", str(tmp_path)]) == 3
+    assert not (tmp_path / "gbr_pop_2020_CN_100m_R2025A_v1.tif").exists()

@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "default_area": "london",
+  "notes": [
+    "bbox is [lon_min, lat_min, lon_max, lat_max], EPSG:4326, longitude first.",
+    "An entry with bbox null is shown in the dashboard as unavailable, with its unavailable_reason. It is never queried.",
+    "validation describes the state of the EVIDENCE for the area, not the availability of the map. 'not_validated' means no complete, validated risk result has been produced for the area.",
+    "Only the london entry is the primary pilot. Other entries must pass their own checks; success in one city does not transfer to another."
+  ],
+  "areas": [
+    {
+      "id": "london",
+      "label": "London, United Kingdom",
+      "country_iso3": "GBR",
+      "role": "primary_pilot",
+      "bbox": [-0.51, 51.28, 0.34, 51.7],
+      "bbox_basis": "Approximate envelope rounded outward from public extreme-point descriptions of Greater London (Crews Hill north, Ditches Lane south, North Ockendon east, M25 junction 14 west). Not verified against the ONS/GLA boundary polygon. Validation must use the boundary before results are reported as city-wide.",
+      "validation": "not_validated",
+      "validation_blockers": [
+        "WorldPop Global2 GBR raster not downloaded in this environment (data hosts unreachable)",
+        "No heat-hazard source implemented (Landsat Collection 2 ST_B10 is the candidate; Sentinel-2 must not be used for land-surface temperature)",
+        "No licensed sensitivity or adaptive-capacity source verified; the England Indices of Deprivation 2025 (OGL v3, LSOA) is a candidate, not yet integrated"
+      ]
+    },
+    {
+      "id": "amsterdam",
+      "label": "Amsterdam, Netherlands",
+      "country_iso3": "NLD",
+      "role": "secondary_pilot",
+      "bbox": null,
+      "unavailable_reason": "Municipal extent not verified. Set it from the CBS municipal boundary (Wijk- en Buurtkaart 2024, gemeenten layer) before any query.",
+      "validation": "not_started",
+      "validation_blockers": [
+        "Runs only after London passes its documented checks; no result transfers from London automatically"
+      ]
+    },
+    {
+      "id": "rotterdam",
+      "label": "Rotterdam, Netherlands",
+      "country_iso3": "NLD",
+      "role": "expansion_candidate",
+      "bbox": null,
+      "unavailable_reason": "Municipal extent not verified. Set it from the CBS municipal boundary (Wijk- en Buurtkaart 2024, gemeenten layer) before any query.",
+      "validation": "not_started",
+      "validation_blockers": [
+        "Runs only after Amsterdam; third-city expansion candidate"
+      ]
+    },
+    {
+      "id": "ouargla",
+      "label": "Ouargla Zone, Algeria (demo)",
+      "country_iso3": "DZA",
+      "role": "demo_legacy",
+      "bbox": [5.1, 31.7, 5.6, 32.2],
+      "bbox_basis": "Original project preset. Retained for the satellite comparison fixtures and the Algeria WorldPop smoke test.",
+      "validation": "not_validated",
+      "validation_blockers": [
+        "No Algeria population raster is configured in the dashboard flow; the Algeria smoke test runs only when GEOSENTINEL_WORLDPOP_RASTER is set"
+      ]
+    },
+    {
+      "id": "el_oued",
+      "label": "El Oued, Algeria (demo)",
+      "country_iso3": "DZA",
+      "role": "demo_legacy",
+      "bbox": [6.6, 33.2, 7.1, 33.7],
+      "bbox_basis": "Original project preset.",
+      "validation": "not_validated",
+      "validation_blockers": ["Demo preset; no population raster configured"]
+    },
+    {
+      "id": "algiers",
+      "label": "Algiers, Algeria (demo)",
+      "country_iso3": "DZA",
+      "role": "demo_legacy",
+      "bbox": [2.9, 36.6, 3.2, 36.9],
+      "bbox_basis": "Original project preset.",
+      "validation": "not_validated",
+      "validation_blockers": ["Demo preset; no population raster configured"]
+    }
+  ]
+}
