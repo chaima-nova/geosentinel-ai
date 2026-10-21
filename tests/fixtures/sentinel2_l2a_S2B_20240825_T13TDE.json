@@ -1,0 +1,215 @@
+{
+  "_fixture_provenance": {
+    "description": "Trimmed real Sentinel-2 L2A STAC item (B04, B08, SCL assets only), used as a metadata regression fixture. No raster data is included.",
+    "item_id": "S2B_MSIL2A_20240825T173909_R098_T13TDE_20240825T215747",
+    "retrieved": "2026-10-21 via GitHub API (contents endpoint)",
+    "source_path": "crates/core/data/two-sentinel-2-items.json",
+    "source_repository": "https://github.com/stac-utils/rustac",
+    "source_repository_licence": "Apache-2.0",
+    "underlying_data": "Copernicus Sentinel-2 L2A (open data, free of charge with attribution to Copernicus / ESA)"
+  },
+  "assets": {
+    "B04": {
+      "eo:bands": [
+        {
+          "center_wavelength": 0.665,
+          "common_name": "red",
+          "description": "Band 4 - Red",
+          "full_width_half_max": 0.038,
+          "name": "B04"
+        }
+      ],
+      "gsd": 10.0,
+      "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/13/T/DE/2024/08/25/S2B_MSIL2A_20240825T173909_N0511_R098_T13TDE_20240825T215747.SAFE/GRANULE/L2A_T13TDE_A039020_20240825T174804/IMG_DATA/R10m/T13TDE_20240825T173909_B04_10m.tif",
+      "proj:bbox": [
+        399960.0,
+        4390200.0,
+        509760.0,
+        4500000.0
+      ],
+      "proj:shape": [
+        10980,
+        10980
+      ],
+      "proj:transform": [
+        10.0,
+        0.0,
+        399960.0,
+        0.0,
+        -10.0,
+        4500000.0
+      ],
+      "roles": [
+        "data"
+      ],
+      "title": "Band 4 - Red - 10m",
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized"
+    },
+    "B08": {
+      "eo:bands": [
+        {
+          "center_wavelength": 0.842,
+          "common_name": "nir",
+          "description": "Band 8 - NIR",
+          "full_width_half_max": 0.145,
+          "name": "B08"
+        }
+      ],
+      "gsd": 10.0,
+      "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/13/T/DE/2024/08/25/S2B_MSIL2A_20240825T173909_N0511_R098_T13TDE_20240825T215747.SAFE/GRANULE/L2A_T13TDE_A039020_20240825T174804/IMG_DATA/R10m/T13TDE_20240825T173909_B08_10m.tif",
+      "proj:bbox": [
+        399960.0,
+        4390200.0,
+        509760.0,
+        4500000.0
+      ],
+      "proj:shape": [
+        10980,
+        10980
+      ],
+      "proj:transform": [
+        10.0,
+        0.0,
+        399960.0,
+        0.0,
+        -10.0,
+        4500000.0
+      ],
+      "roles": [
+        "data"
+      ],
+      "title": "Band 8 - NIR - 10m",
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized"
+    },
+    "SCL": {
+      "gsd": 20.0,
+      "href": "https://sentinel2l2a01.blob.core.windows.net/sentinel2-l2/13/T/DE/2024/08/25/S2B_MSIL2A_20240825T173909_N0511_R098_T13TDE_20240825T215747.SAFE/GRANULE/L2A_T13TDE_A039020_20240825T174804/IMG_DATA/R20m/T13TDE_20240825T173909_SCL_20m.tif",
+      "proj:bbox": [
+        399960.0,
+        4390200.0,
+        509760.0,
+        4500000.0
+      ],
+      "proj:shape": [
+        5490,
+        5490
+      ],
+      "proj:transform": [
+        20.0,
+        0.0,
+        399960.0,
+        0.0,
+        -20.0,
+        4500000.0
+      ],
+      "roles": [
+        "data"
+      ],
+      "title": "Scene classfication map (SCL)",
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized"
+    }
+  },
+  "bbox": [
+    -105.3636533,
+    39.6593882,
+    -104.8845569,
+    40.6507988
+  ],
+  "collection": "sentinel-2-l2a",
+  "geometry": {
+    "coordinates": [
+      [
+        [
+          -105.3636533,
+          39.6593882
+        ],
+        [
+          -105.3194891,
+          39.8060109
+        ],
+        [
+          -105.2765332,
+          39.9536675
+        ],
+        [
+          -105.2327063,
+          40.1011169
+        ],
+        [
+          -105.1880901,
+          40.2483738
+        ],
+        [
+          -105.1436644,
+          40.3956704
+        ],
+        [
+          -105.0990149,
+          40.5428492
+        ],
+        [
+          -105.0663671,
+          40.6499582
+        ],
+        [
+          -104.8845569,
+          40.6507988
+        ],
+        [
+          -104.8862201,
+          39.6615512
+        ],
+        [
+          -105.3636533,
+          39.6593882
+        ]
+      ]
+    ],
+    "type": "Polygon"
+  },
+  "id": "S2B_MSIL2A_20240825T173909_R098_T13TDE_20240825T215747",
+  "links": [],
+  "properties": {
+    "constellation": "Sentinel 2",
+    "datetime": "2024-08-25T17:39:09.024000Z",
+    "eo:cloud_cover": 48.747352,
+    "instruments": [
+      "msi"
+    ],
+    "platform": "Sentinel-2B",
+    "proj:epsg": 32613,
+    "s2:cloud_shadow_percentage": 0.598632,
+    "s2:datastrip_id": "S2B_OPER_MSI_L2A_DS_2BPS_20240825T215747_S20240825T174804_N05.11",
+    "s2:datatake_id": "GS2B_20240825T173909_039020_N05.11",
+    "s2:datatake_type": "INS-NOBS",
+    "s2:degraded_msi_data_percentage": 0.0,
+    "s2:generation_time": "2024-08-25T21:57:47.000000Z",
+    "s2:granule_id": "S2B_OPER_MSI_L2A_TL_2BPS_20240825T215747_A039020_T13TDE_N05.11",
+    "s2:high_proba_clouds_percentage": 19.551201,
+    "s2:mean_solar_azimuth": 147.243556565213,
+    "s2:mean_solar_zenith": 33.6615274396343,
+    "s2:medium_proba_clouds_percentage": 27.708223,
+    "s2:mgrs_tile": "13TDE",
+    "s2:nodata_pixel_percentage": 74.752849,
+    "s2:not_vegetated_percentage": 31.641838,
+    "s2:processing_baseline": "05.11",
+    "s2:product_type": "S2MSI2A",
+    "s2:product_uri": "S2B_MSIL2A_20240825T173909_N0511_R098_T13TDE_20240825T215747.SAFE",
+    "s2:reflectance_conversion_factor": 0.977803669193003,
+    "s2:saturated_defective_pixel_percentage": 0.0,
+    "s2:snow_ice_percentage": 0.0,
+    "s2:thin_cirrus_percentage": 1.487926,
+    "s2:unclassified_percentage": 5.732427,
+    "s2:vegetation_percentage": 11.635023,
+    "s2:water_percentage": 1.627593,
+    "sat:orbit_state": "descending",
+    "sat:relative_orbit": 98
+  },
+  "stac_extensions": [
+    "https://stac-extensions.github.io/eo/v1.0.0/schema.json",
+    "https://stac-extensions.github.io/sat/v1.0.0/schema.json",
+    "https://stac-extensions.github.io/projection/v1.0.0/schema.json"
+  ],
+  "stac_version": "1.0.0",
+  "type": "Feature"
+}

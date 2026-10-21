@@ -45,21 +45,45 @@ QUANTIFICATION_VALUE`` with ``BOA_ADD_OFFSET = -1000`` and
 is read from the STAC item (``s2:processing_baseline``) or from the product name
 (``_N0510_``). If it cannot be determined, NDVI is not computed.
 
+Metadata checks (``resolve_reflectance_offset``) run before any pixel is read.
+The baseline in ``s2:processing_baseline`` must agree with the product name, and
+any ``raster:bands`` scale/offset an asset declares must equal the L2A convention
+``(DN + offset) / 10000``. Otherwise NDVI is withheld with a stated reason. The
+convention was cross-checked against the product-level ``BOA_ADD_OFFSET_VALUES_LIST``
+as read by GDAL and satpy. The full policy is in
+``docs/satellite/sentinel2-scientific-validation.md``.
+
+Area of interest
+----------------
+When a bounding box is requested, only its window of each raster is read. The
+SCL is read at native resolution over the same window. ``footprint_fraction``
+records how much of the requested area lies inside the scene. Coverage is
+multiplied by it, so an area that extends past the scene edge loses coverage
+rather than being scored as if it were usable.
+
 Pixels are excluded from NDVI when the Scene Classification Layer (SCL) marks
 them as no-data, defective, dark, cloud shadow, cloud (medium or high
-probability) or cirrus. Excluded and out-of-footprint pixels are *not* counted
-as vegetation. ``ndvi_valid_coverage`` reports the fraction of the footprint that
-was usable, and an NDVI whose coverage is below ``min_valid_coverage`` is reported
-as ``NDVI_NO_DATA`` rather than as a value.
+probability), cirrus, water or snow/ice. Water and snow are excluded by policy
+because they would bias a vegetation indicator; an area dominated by them is
+therefore withheld. ``ndvi_valid_coverage`` reports the fraction of the requested
+area that was usable, and an NDVI whose coverage is below ``min_valid_coverage``
+is reported as ``NDVI_NO_DATA`` rather than as a value.
 
 Known limitations
 -----------------
+* Band and SCL asset keys are matched for both the canonical names (``B04``,
+  ``SCL``) and the CDSE names (``B04_10m``, ``SCL_20m``). The CDSE names come
+  from the MIT-licensed mapchete-eo mapping; live CDSE items were not reachable
+  from the build environment, so they are unverified against a live response.
 * Sentinel-2 carries **no thermal band**, so ``lst_celsius_max`` cannot come
   from this collection and is always ``LST_NOT_AVAILABLE`` here. Land-surface
   temperature needs Sentinel-3 SLSTR or Landsat TIRS.
-* Mean NDVI requires reading actual pixels. Bands are decimated to at most
-  ``max_sample_pixels`` pixels with average resampling, so the result is an
-  estimate over a coarsened grid, not a full-resolution statistic.
+* Mean NDVI requires reading actual pixels. The AOI window is decimated to at most
+  ``max_sample_pixels`` pixels with average resampling, so for a city-sized area
+  the result is an estimate over a coarse grid (about 16 x 16 cells at the
+  default budget), not a full-resolution statistic.
+* Window edges are rounded to the nearest pixel boundary, so a bounding box is
+  represented to within half a 10 m pixel.
 """
 
 from __future__ import annotations
@@ -69,7 +93,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -89,9 +113,11 @@ __all__ = [
     "NIR_BAND",
     "RED_BAND",
     "SCL_INVALID_CLASSES",
+    "SCL_NON_VEGETATION_CLASSES",
     "UNAVAILABLE_STAC_ID",
     "BandSample",
     "NdviResult",
+    "OutsideSceneError",
     "SatelliteDataService",
     "SatelliteServiceError",
     "boa_add_offset",
@@ -100,6 +126,7 @@ __all__ = [
     "processing_baseline",
     "read_band_sample",
     "read_scl_sample",
+    "resolve_reflectance_offset",
     "scl_invalid_mask",
 ]
 
@@ -115,8 +142,8 @@ RED_BAND = "B04"
 NIR_BAND = "B08"
 
 #: Sentinel-2 keys used in STAC ``assets``, in preferred order.
-RED_BAND_KEYS = ("B04", "b04", "red", "B4")
-NIR_BAND_KEYS = ("B08", "b08", "nir", "B8")
+RED_BAND_KEYS = ("B04_10m", "B04", "b04", "red", "B4")
+NIR_BAND_KEYS = ("B08_10m", "B08", "b08", "nir", "B8")
 
 #: Property keys that may carry scene cloud cover, in preferred order.
 CLOUD_COVER_KEYS = ("eo:cloud_cover", "cloudCover", "cloud_cover", "s2:cloud_cover")
@@ -130,12 +157,19 @@ NDVI_NO_DATA = -1.0
 
 #: Sentinel-2 scene classification layer (SCL), 20 m, one class per pixel.
 SCL_BAND = "SCL"
-SCL_KEYS = ("SCL", "scl")
+SCL_KEYS = ("SCL_20m", "SCL", "scl")
 #: SCL classes treated as unusable for NDVI: 0 no data, 1 saturated or defective,
 #: 2 dark area, 3 cloud shadow, 8 cloud medium probability, 9 cloud high
 #: probability, 10 thin cirrus. Vegetation (4), bare soil (5), water (6),
 #: unclassified (7) and snow (11) are kept.
 SCL_INVALID_CLASSES: frozenset[int] = frozenset({0, 1, 2, 3, 8, 9, 10})
+#: SCL classes excluded from the *vegetation* NDVI mean by policy: 6 water and
+#: 11 snow/ice. Water has negative NDVI and snow is not vegetation, so keeping
+#: them would bias an urban vegetation indicator. Excluding them lowers
+#: ``ndvi_valid_coverage``, so an AOI dominated by water or snow is withheld
+#: rather than reported. This is a documented policy choice, not a
+#: scientifically established rule (see docs/satellite/sentinel2-scientific-validation.md).
+SCL_NON_VEGETATION_CLASSES: frozenset[int] = frozenset({6, 11})
 
 #: Sentinel-2 L2A quantification value (reflectance = DN / 10000 before offset).
 QUANTIFICATION_VALUE = 10000.0
@@ -144,7 +178,12 @@ BOA_OFFSET_FIRST_BASELINE = 4.00
 #: BOA_ADD_OFFSET for baseline >= 04.00, per the Copernicus L2A product guide.
 BOA_ADD_OFFSET_PB04 = -1000.0
 
-#: Minimum fraction of the footprint that must be usable for NDVI to be reported.
+#: Default minimum fraction of the requested area that must be usable (not masked
+#: by SCL, and inside the scene) for NDVI to be reported.
+#: This is a POLICY CHOICE, not a scientifically established threshold. It is
+#: configurable through ``SatelliteDataService(min_valid_coverage=...)``. Below it,
+#: NDVI is withheld as ``NDVI_NO_DATA`` and the evidence auditor treats the
+#: satellite evidence as unusable. See docs/satellite/sentinel2-scientific-validation.md §4.
 DEFAULT_MIN_VALID_COVERAGE = 0.9
 #: How many clear-enough scenes to try before giving up on NDVI.
 DEFAULT_MAX_CANDIDATES = 3
@@ -182,6 +221,10 @@ class SatelliteServiceError(RuntimeError):
     """Raised only for programming errors, never for operational failures."""
 
 
+class OutsideSceneError(SatelliteServiceError):
+    """The requested area does not intersect the raster at all."""
+
+
 @dataclass(frozen=True)
 class BandSample:
     """Decimated pixel samples of a single band.
@@ -190,10 +233,13 @@ class BandSample:
         values: 2-D array of reflectance samples, already flattened of its band
             axis.
         nodata: The source's nodata sentinel, or ``None`` if it declares none.
+        footprint_fraction: Share of the requested area that lies inside the
+            raster, in (0, 1]. ``1.0`` when no area was requested.
     """
 
     values: Any  # numpy.ndarray; typed loosely to avoid a hard numpy import here
     nodata: float | None = None
+    footprint_fraction: float = 1.0
 
 
 class SatelliteDataService:
@@ -263,13 +309,11 @@ class SatelliteDataService:
         self.limit = limit
         self.timeout = timeout
         self.max_sample_pixels = max_sample_pixels
-        self._band_reader = band_reader or partial(
-            read_band_sample, max_sample_pixels=max_sample_pixels
-        )
-        # An injected band reader is taken to serve every raster (tests use one
-        # in-memory reader). Production reads the SCL at native resolution, so
-        # class codes are never averaged.
-        self._scl_reader: BandReader = scl_reader or band_reader or read_scl_sample
+        # Injected readers take an href only and serve every raster (tests use an
+        # in-memory reader). Production readers are bound to the requested AOI per
+        # call in _readers(), so only that window of the scene is read.
+        self._band_reader_override: BandReader | None = band_reader
+        self._scl_reader_override: BandReader | None = scl_reader or band_reader
         self.min_valid_coverage = min_valid_coverage
         self.max_candidates = max_candidates
         self._transport = transport
@@ -378,10 +422,11 @@ class SatelliteDataService:
         for item in candidates[: self.max_candidates]:
             stac_id = str(item.get("id") or UNAVAILABLE_STAC_ID)
             band_links = self._resolve_bands(item)
-            baseline = processing_baseline(item)
-            offset = boa_add_offset(baseline)
+            baseline, offset, reason = resolve_reflectance_offset(item)
+            if reason is not None:
+                logger.warning("scene %s: %s; NDVI withheld", stac_id, reason)
             ndvi = await self._safe_ndvi(
-                band_links, self._resolve_scl(item), stac_id, offset
+                band_links, self._resolve_scl(item), stac_id, offset, window.bbox
             )
             coverage = ndvi.valid_coverage
             logger.info(
@@ -409,7 +454,7 @@ class SatelliteDataService:
             self.min_valid_coverage * 100,
             f"{ndvi.valid_coverage:.1%}" if ndvi.valid_coverage is not None else "unknown",
         )
-        baseline = processing_baseline(item)
+        baseline, offset, _ = resolve_reflectance_offset(item)
         return self._layer_metadata(
             item,
             stac_id,
@@ -417,7 +462,7 @@ class SatelliteDataService:
             None,
             ndvi.valid_coverage,
             baseline,
-            boa_add_offset(baseline),
+            offset,
         ).model_dump()
 
     def _layer_metadata(
@@ -644,7 +689,7 @@ class SatelliteDataService:
                         if href is not None:
                             return href
             href = href_of(asset)
-            if href and (f"{band}." in href.upper() or f"{band}/" in href.upper()):
+            if href and any(marker in href.upper() for marker in (f"{band}.", f"{band}/", f"{band}_")):
                 return href
         return None
 
@@ -658,17 +703,37 @@ class SatelliteDataService:
             return None
         return SatelliteDataService._find_asset_href(assets, SCL_BAND, SCL_KEYS)
 
+    def _readers(self, bbox: Sequence[float] | None) -> tuple[BandReader, BandReader]:
+        """Return the ``(band, SCL)`` readers for one requested area.
+
+        Injected readers are used as given. Production readers are bound to
+        ``bbox`` so that only the requested window of each raster is read.
+        """
+        if self._band_reader_override is not None:
+            band_reader = self._band_reader_override
+        else:
+            band_reader = partial(
+                read_band_sample, max_sample_pixels=self.max_sample_pixels, bbox=bbox
+            )
+        if self._scl_reader_override is not None:
+            scl_reader = self._scl_reader_override
+        else:
+            scl_reader = partial(read_scl_sample, bbox=bbox)
+        return band_reader, scl_reader
+
     async def _safe_ndvi(
         self,
         band_links: dict[str, str],
         scl_href: str | None,
         stac_id: str,
         offset: float | None,
+        bbox: Sequence[float] | None = None,
     ) -> NdviResult:
-        """Compute coverage-aware NDVI, converting every failure into ``NdviResult(None, None)``.
+        """Compute coverage-aware NDVI, converting every failure into a withheld result.
 
-        Refuses to compute NDVI without a cloud mask or a known reflectance offset,
-        because either absence would make the result unsupported.
+        Refuses to compute NDVI without a cloud mask or a determinable reflectance
+        offset, because either absence would make the result unsupported. A scene
+        that does not intersect the requested area reports coverage ``0.0``.
         """
         missing = [band for band in (RED_BAND, NIR_BAND) if band not in band_links]
         if missing:
@@ -687,8 +752,7 @@ class SatelliteDataService:
             return NdviResult(None, None)
         if offset is None:
             logger.warning(
-                "scene %s has an unknown processing baseline; reflectance offset cannot "
-                "be determined, NDVI not computed",
+                "scene %s: reflectance offset cannot be determined; NDVI not computed",
                 stac_id,
             )
             return NdviResult(None, None)
@@ -702,7 +766,11 @@ class SatelliteDataService:
                 band_links[NIR_BAND],
                 scl_href,
                 offset,
+                bbox,
             )
+        except OutsideSceneError as exc:
+            logger.warning("scene %s does not cover the requested area: %s", stac_id, exc)
+            return NdviResult(None, 0.0)
         except Exception as exc:  # noqa: BLE001 - any raster failure is non-fatal
             logger.warning(
                 "could not read bands for scene %s: %s: %s",
@@ -713,7 +781,12 @@ class SatelliteDataService:
             return NdviResult(None, None)
 
     def _ndvi(
-        self, red_href: str, nir_href: str, scl_href: str, offset: float
+        self,
+        red_href: str,
+        nir_href: str,
+        scl_href: str,
+        offset: float,
+        bbox: Sequence[float] | None = None,
     ) -> NdviResult:
         """Compute coverage-aware NDVI from band hrefs. Blocking; runs in a thread.
 
@@ -722,16 +795,18 @@ class SatelliteDataService:
             nir_href: Asset href for the NIR band.
             scl_href: Asset href for the scene classification layer.
             offset: BOA additive offset to apply to DN before scaling.
+            bbox: Requested area in EPSG:4326, or ``None`` for the whole scene.
 
         Returns:
-            The :class:`NdviResult` for the footprint.
+            The :class:`NdviResult` for the requested area.
 
         Raises:
             Exception: Propagates rasterio/GDAL errors to :meth:`_safe_ndvi`.
         """
-        red = self._band_reader(red_href)
-        nir = self._band_reader(nir_href)
-        scl = self._scl_reader(scl_href)
+        band_reader, scl_reader = self._readers(bbox)
+        red = band_reader(red_href)
+        nir = band_reader(nir_href)
+        scl = scl_reader(scl_href)
         invalid = scl_invalid_mask(scl.values, np.shape(red.values))
         return compute_ndvi(
             red,
@@ -740,7 +815,6 @@ class SatelliteDataService:
             quantification_value=QUANTIFICATION_VALUE,
             scl_invalid=invalid,
         )
-
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -759,6 +833,11 @@ def processing_baseline(item: dict[str, Any]) -> float | None:
         parsed = _parse_baseline(value)
         if parsed is not None:
             return parsed
+    return _baseline_from_id(item)
+
+
+def _baseline_from_id(item: dict[str, Any]) -> float | None:
+    """Baseline encoded in the product identifier token ``_Nxxyy_``, or ``None``."""
     match = re.search(r"_N(\d{2})(\d{2})_", str(item.get("id") or ""))
     if match:
         return int(match.group(1)) + int(match.group(2)) / 100.0
@@ -790,6 +869,96 @@ def boa_add_offset(baseline: float | None) -> float | None:
     if baseline is None:
         return None
     return BOA_ADD_OFFSET_PB04 if baseline >= BOA_OFFSET_FIRST_BASELINE - 1e-9 else 0.0
+
+
+def resolve_reflectance_offset(
+    item: dict[str, Any],
+) -> tuple[float | None, float | None, str | None]:
+    """Decide the BOA offset for an item, or withhold it with a reason.
+
+    The offset is derived from the processing baseline, matching the
+    ``BOA_ADD_OFFSET_VALUES_LIST`` convention of the Sentinel-2 L2A product
+    metadata (GDAL and satpy both read that list). Fail-closed checks:
+
+    * the baseline in ``s2:processing_baseline`` must agree with the ``_Nxxyy_``
+      token in the product identifier, when both are present;
+    * the baseline must be known;
+    * if an asset declares ``raster:bands`` scale and offset, they must equal the
+      L2A convention ``(DN + offset) / 10000``. A collection that already applied
+      the offset, or stores raw DN, would otherwise be double-corrected or
+      under-corrected.
+
+    Args:
+        item: A STAC item.
+
+    Returns:
+        ``(baseline, offset, reason)``. When ``reason`` is not ``None`` the offset
+        is ``None`` and NDVI must not be computed from this item.
+    """
+    properties = item.get("properties")
+    declared = (
+        _parse_baseline(properties.get("s2:processing_baseline"))
+        if isinstance(properties, dict)
+        else None
+    )
+    from_name = _baseline_from_id(item)
+    if declared is not None and from_name is not None and abs(declared - from_name) > 1e-9:
+        return (
+            declared,
+            None,
+            (
+                f"processing baseline is inconsistent (properties {declared:05.2f}, "
+                f"product name {from_name:05.2f})"
+            ),
+        )
+    baseline = declared if declared is not None else from_name
+    offset = boa_add_offset(baseline)
+    if offset is None:
+        return None, None, "processing baseline is unknown"
+    mismatch = _declared_scaling_mismatch(item, offset)
+    if mismatch is not None:
+        return baseline, None, mismatch
+    return baseline, offset, None
+
+
+def _declared_scaling_mismatch(item: dict[str, Any], offset: float) -> str | None:
+    """Describe a ``raster:bands`` scale/offset that contradicts the L2A convention."""
+    assets = item.get("assets")
+    if not isinstance(assets, dict):
+        return None
+    expected_scale = 1.0 / QUANTIFICATION_VALUE
+    expected_offset = offset / QUANTIFICATION_VALUE
+    for band, keys in ((RED_BAND, RED_BAND_KEYS), (NIR_BAND, NIR_BAND_KEYS)):
+        href = SatelliteDataService._find_asset_href(assets, band, keys)
+        if href is None:
+            continue
+        asset = next(
+            (a for a in assets.values() if isinstance(a, dict) and a.get("href") == href),
+            None,
+        )
+        if asset is None:
+            continue
+        entries = asset.get("raster:bands")
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict) or "scale" not in entry or "offset" not in entry:
+                continue
+            scale, declared_offset = entry["scale"], entry["offset"]
+            if not all(
+                isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                for v in (scale, declared_offset)
+            ):
+                return f"{band} declares a non-numeric scale or offset"
+            if not (
+                math.isclose(scale, expected_scale, rel_tol=1e-9)
+                and math.isclose(declared_offset, expected_offset, rel_tol=1e-9, abs_tol=1e-12)
+            ):
+                return (
+                    f"{band} declares scale {scale} and offset {declared_offset}, which do "
+                    f"not match (DN + {offset:g}) / {QUANTIFICATION_VALUE:g}"
+                )
+    return None
 
 
 def _resample_any(mask: np.ndarray, axis: int, target: int) -> np.ndarray:
@@ -824,7 +993,8 @@ def scl_invalid_mask(scl: Any, target_shape: tuple[int, ...]) -> np.ndarray:
     classes = np.asarray(scl)
     if classes.ndim != 2 or len(target_shape) != 2:
         raise SatelliteServiceError("scene classification and band samples must be 2-D")
-    invalid = np.isin(classes, np.fromiter(SCL_INVALID_CLASSES, dtype=classes.dtype))
+    excluded = SCL_INVALID_CLASSES | SCL_NON_VEGETATION_CLASSES
+    invalid = np.isin(classes, np.fromiter(excluded, dtype=classes.dtype))
     invalid = _resample_any(invalid, 0, target_shape[0])
     return _resample_any(invalid, 1, target_shape[1])
 
@@ -870,6 +1040,7 @@ def compute_ndvi(
         return NdviResult(None, None)
 
     total = red_dn.size
+    footprint = min(red.footprint_fraction, nir.footprint_fraction)
     usable = np.isfinite(red_dn) & np.isfinite(nir_dn)
     if red.nodata is not None:
         usable &= red_dn != float(red.nodata)
@@ -882,7 +1053,7 @@ def compute_ndvi(
     nir_r = (nir_dn + reflectance_offset) / quantification_value
     usable &= (nir_r + red_r) != 0
     count = int(usable.sum())
-    coverage = count / total if total else 0.0
+    coverage = (count / total) * footprint if total else 0.0
     if count == 0:
         logger.warning("no usable pixel in footprint; NDVI not computed")
         return NdviResult(None, coverage)
@@ -891,13 +1062,60 @@ def compute_ndvi(
     return NdviResult(float(np.clip(ndvi.mean(), -1.0, 1.0)), coverage)
 
 
-def read_scl_sample(href: str) -> BandSample:
+def _edge(value: float) -> int:
+    """Nearest pixel boundary for a window edge.
+
+    A pixel is included only when at least half of it lies in the requested area.
+    Rounding outward instead would pull in a neighbouring column whenever the
+    EPSG:4326 -> raster round trip overshoots a boundary by a fraction of a pixel
+    (a lon/lat rectangle becomes a slightly larger rectangle in UTM).
+    """
+    return round(value)
+
+
+def _aoi_window(source: Any, bbox: Sequence[float]) -> tuple[Any, float]:
+    """Pixel window of ``source`` covering ``bbox``, and the share of ``bbox`` inside it.
+
+    ``bbox`` is EPSG:4326 and is transformed to the raster CRS (Sentinel-2 tiles
+    are UTM). Window edges are rounded to the nearest pixel boundary and clipped
+    to the raster. The returned fraction is the share of the requested area that
+    lies inside the raster, computed before rounding.
+
+    Raises:
+        OutsideSceneError: If no part of ``bbox`` lies inside the raster.
+    """
+    from rasterio.errors import WindowError
+    from rasterio.warp import transform_bounds
+    from rasterio.windows import Window, from_bounds
+
+    left, bottom, right, top = transform_bounds("EPSG:4326", source.crs, *bbox)
+    requested = from_bounds(left, bottom, right, top, transform=source.transform)
+    requested_area = requested.width * requested.height
+    if requested_area <= 0:
+        raise OutsideSceneError("requested area has no extent in the raster CRS")
+    try:
+        inside = requested.intersection(Window(0, 0, source.width, source.height))
+    except WindowError as exc:
+        raise OutsideSceneError("requested area lies outside the scene") from exc
+    fraction = (inside.width * inside.height) / requested_area
+
+    col0 = max(0, _edge(inside.col_off))
+    row0 = max(0, _edge(inside.row_off))
+    col1 = min(source.width, _edge(inside.col_off + inside.width))
+    row1 = min(source.height, _edge(inside.row_off + inside.height))
+    if col1 <= col0 or row1 <= row0:
+        raise OutsideSceneError("requested area contains no whole pixel of the scene")
+    return Window(col0, row0, col1 - col0, row1 - row0), fraction
+
+
+def read_scl_sample(href: str, *, bbox: Sequence[float] | None = None) -> BandSample:
     """Read the scene classification layer at native resolution. Blocking.
 
     Never decimated: resampling would average class codes into meaningless values.
 
     Args:
         href: Asset href or local path.
+        bbox: Optional EPSG:4326 area; only that window is read.
 
     Returns:
         A :class:`BandSample` of class codes.
@@ -907,7 +1125,12 @@ def read_scl_sample(href: str) -> BandSample:
     with rasterio.open(href) as source:
         if source.height <= 0 or source.width <= 0:
             raise SatelliteServiceError(f"SCL {href!r} reported an empty extent")
-        return BandSample(values=source.read(1, masked=False), nodata=None)
+        if bbox is None:
+            window, fraction = None, 1.0
+        else:
+            window, fraction = _aoi_window(source, bbox)
+        values = source.read(1, window=window, masked=False)
+        return BandSample(values=values, nodata=None, footprint_fraction=fraction)
 
 
 def mean_ndvi(red: BandSample, nir: BandSample) -> float | None:
@@ -958,38 +1181,55 @@ def mean_ndvi(red: BandSample, nir: BandSample) -> float | None:
     return float(np.clip(ndvi.mean(), -1.0, 1.0))
 
 
-def read_band_sample(href: str, *, max_sample_pixels: int = 256) -> BandSample:
-    """Read a decimated sample of one band. Blocking; runs in a thread.
+def read_band_sample(
+    href: str,
+    *,
+    max_sample_pixels: int = 256,
+    bbox: Sequence[float] | None = None,
+) -> BandSample:
+    """Read a decimated sample of one band over the requested area. Blocking.
 
-    Full-resolution Sentinel-2 10 m tiles are 10980x10980, so the band is
-    decimated by an integer factor that brings it under ``max_sample_pixels``
-    using average resampling. That keeps the estimate representative while
-    bounding memory and bandwidth.
+    Full-resolution Sentinel-2 10 m tiles are 10980x10980 and cover about
+    110 km, far larger than a city. When ``bbox`` is given only its window is read,
+    then decimated by an integer factor that brings it under ``max_sample_pixels``
+    using average resampling. The result is an estimate over a coarsened grid,
+    not a full-resolution statistic.
 
     Args:
         href: Asset href or local path.
         max_sample_pixels: Upper bound on the number of pixels returned.
+        bbox: Optional EPSG:4326 area. ``None`` reads the whole raster.
 
     Returns:
-        A :class:`BandSample` of the first band.
+        A :class:`BandSample` of the first band, with its ``footprint_fraction``.
 
     Raises:
+        OutsideSceneError: If ``bbox`` does not intersect the raster.
         rasterio.errors.RasterioError: If the asset cannot be opened or read.
     """
     import rasterio
     from rasterio.enums import Resampling
+    from rasterio.windows import Window
 
     with rasterio.open(href) as source:
-        height, width = source.height, source.width
-        if height <= 0 or width <= 0:
+        if source.height <= 0 or source.width <= 0:
             raise SatelliteServiceError(f"band {href!r} reported an empty extent")
-        # Integer decimation factor that brings the tile under the pixel budget.
+        if bbox is None:
+            window, fraction = Window(0, 0, source.width, source.height), 1.0
+        else:
+            window, fraction = _aoi_window(source, bbox)
+        height, width = int(window.height), int(window.width)
+        # Integer decimation factor that brings the window under the pixel budget.
         factor = max(1, math.ceil(math.sqrt((height * width) / max(1, max_sample_pixels))))
         out_shape = (max(1, height // factor), max(1, width // factor))
         data = source.read(
-            1, out_shape=out_shape, resampling=Resampling.average, masked=False
+            1,
+            window=window,
+            out_shape=out_shape,
+            resampling=Resampling.average,
+            masked=False,
         )
-        return BandSample(values=data, nodata=source.nodata)
+        return BandSample(values=data, nodata=source.nodata, footprint_fraction=fraction)
 
 
 def _rfc3339(moment: datetime) -> str:

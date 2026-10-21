@@ -30,6 +30,7 @@ from app.services.risk_service import EvidenceProvenance, VulnerabilityContext
 from app.services.satellite_service import (
     NDVI_NO_DATA,
     SCL_INVALID_CLASSES,
+    SCL_NON_VEGETATION_CLASSES,
     UNAVAILABLE_STAC_ID,
     BandSample,
     NdviResult,
@@ -174,10 +175,17 @@ class TestSclMask:
         mask = scl_invalid_mask(np.array([[scl_class]], dtype="uint8"), (1, 1))
         assert mask[0, 0]
 
-    @pytest.mark.parametrize("scl_class", [4, 5, 6, 7, 11])
+    @pytest.mark.parametrize("scl_class", [4, 5, 7])
     def test_usable_classes_are_kept(self, scl_class: int) -> None:
+        # 4 vegetation, 5 bare soil, 7 unclassified (kept, flagged as uncertain in docs).
         mask = scl_invalid_mask(np.array([[scl_class]], dtype="uint8"), (1, 1))
         assert not mask[0, 0]
+
+    @pytest.mark.parametrize("scl_class", sorted(SCL_NON_VEGETATION_CLASSES))
+    def test_non_vegetation_classes_are_excluded_by_policy(self, scl_class: int) -> None:
+        # 6 water and 11 snow/ice bias a vegetation mean, so they are excluded.
+        mask = scl_invalid_mask(np.array([[scl_class]], dtype="uint8"), (1, 1))
+        assert mask[0, 0]
 
     def test_single_cloud_pixel_survives_downsampling(self) -> None:
         """Nearest-neighbour decimation can drop one pixel; any-pixel reduction cannot."""
