@@ -225,3 +225,6 @@ __marimo__/
 node_modules/
 frontend/dist/
 *.tsbuildinfo
+
+# Downloaded external datasets (large rasters, licence-bound). Never commit.
+/data/external/

@@ -42,6 +42,7 @@ from app.agents.coordinator import CoordinatorAgent
 from app.core.config import Settings, get_settings
 from app.core.schemas import RiskAnalysisResult, SpatialQueryRequest
 from app.services.satellite_service import DEFAULT_STAC_URL
+from app.services.worldpop_provider import WorldPopExposureProvider
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,20 @@ SettingsDep = Annotated[Settings, Depends(get_current_settings)]
 # ---------------------------------------------------------------------------
 
 
+def _build_coordinator(settings: Settings) -> CoordinatorAgent:
+    """Wire the coordinator, adding the WorldPop provider only when a raster is configured.
+
+    With no path configured the coordinator keeps its ``MissingVulnerabilityProvider``
+    default, so no demographic evidence is invented. Even with a valid raster the
+    provider supplies population exposure only, so the HEPS score stays withheld.
+    """
+    if not settings.worldpop_raster_path.strip():
+        return CoordinatorAgent()
+    return CoordinatorAgent(
+        vulnerability_provider=WorldPopExposureProvider(settings.worldpop_raster_path.strip())
+    )
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the FastAPI application.
 
@@ -131,7 +146,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         """Own the coordinator for the life of the process."""
         application.state.settings = resolved
-        application.state.coordinator = CoordinatorAgent()
+        application.state.coordinator = _build_coordinator(resolved)
         logger.info(
             "%s v%s starting (environment=%s, cors=%s)",
             resolved.app_name,

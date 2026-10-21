@@ -95,6 +95,15 @@ class Settings(BaseSettings):
         default=SecretStr(""),
         description="Client secret for the Copernicus Data Space Ecosystem OAuth2 flow.",
     )
+    worldpop_raster_path: str = Field(
+        default="",
+        description=(
+            "Path to a locally downloaded WorldPop population GeoTIFF (see "
+            "tools/vulnerability/fetch_worldpop.py). Empty disables the population-"
+            "exposure provider. The HEPS score stays withheld either way, because "
+            "population exposure alone is not a vulnerability index."
+        ),
+    )
 
     # --- Validation -----------------------------------------------------
     @field_validator("cors_origins", mode="before")
